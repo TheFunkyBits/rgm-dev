@@ -58,6 +58,56 @@ included build; convention dependencies substitute `dev.thefunkybits.rgm.dev:rgm
 Kotlin application, dependencies, logging, forks and task policy remain local. Client source
 packets retain usable plugin source/licence/build inputs under `rgm-dev/`, not unrelated tools.
 
+## Git Workspace Delivery
+
+[scripts/git_workspace.py](scripts/git_workspace.py) delivers explicitly reviewed source changes
+across independent worktrees. Use Python 3.11+, an absolute Git executable and an explicit workspace
+Git root. Keep the per-operation selection JSON outside the workspace and outside Git:
+
+```text
+python -B scripts/git_workspace.py review --workspace <root> --selection <external-json> --git <git-executable>
+python -B scripts/git_workspace.py apply --dry-run --workspace <root> --selection <external-json> --git <git-executable>
+python -B scripts/git_workspace.py apply --confirm --workspace <root> --selection <external-json> --git <git-executable>
+python -B scripts/git_workspace.py inspect --workspace <root> --selection <external-json> --git <git-executable>
+python -B scripts/git_workspace.py apply --continue --confirm --workspace <root> --selection <external-json> --git <git-executable>
+```
+
+The selection has exactly a `repositories` array in delivery order. Each entry supplies `label`,
+workspace-relative `root` (`.` for the parent), credential-free canonical `remote`, `branch`,
+full reviewed `head`, approved oldest-first `outgoing` commit IDs, exact `paths` and `message`.
+Each path entry is `{"path":"relative/file","stage":"worktree"}`. `index` preserves already-staged
+content and any separate unstaged edits; `whole` explicitly approves replacing a partially staged
+path with its whole worktree file. Both rename endpoints need approval. No directory-wide,
+ignored-file or blanket staging is supported; an approved index-only deletion never reads the
+retained worktree path.
+
+The final parent entry additionally names every registered child in `gitlinks`, mapping each
+parent-relative child leaf to its earlier selected label. Include unchanged children with empty
+`paths` and `outgoing` arrays; they are skipped without empty commits. A one-time extra repository
+may be explicitly selected before the parent without becoming a registered child. The parent
+waits for all selected targets, then stages only approved gitlinks selecting their observed pushed
+commits. Repository topology, path selections and messages remain caller-owned, never hardcoded here.
+
+All targets are preflighted before Git source/index/ref mutation. Refuse unexpected staged paths,
+conflicts, detached/drifting branches, shared indexes, unsafe links, noncanonical/multiple push
+destinations and unknown remote ancestry. Review uses live remote refs, not stale tracking counts.
+There is no implicit fetch, pull, rebase, reset, force push, tag push or deployment dispatch.
+Normal Git line-ending handling remains in force. Dry-run is read-only and cannot prove hook
+success or future remote acceptance.
+
+Apply needs explicit commit/push authorization and `--confirm`. Pushes select the original commit
+with a non-force branch refspec and `--no-follow-tags`. Stop on rejection, changed scope or lost
+acknowledgement; retain successful partial work and local commits. Original selection and minimal
+commit/push intent live privately in the workspace Git directory as `git-workspace-delivery.json`,
+with a process lock alongside it. Do not delete or alter this control to force a restart. Inspect
+first, resolve the reported condition, then explicitly continue with the unchanged selection.
+An already-observed original push is accepted without replay. Completion removes this operation's
+control, not independent records, tags or history. JSON outcomes go to stdout; sanitized failures
+go to stderr. Hooks and push-triggered source CI retain their owning behavior and approvals.
+
+Focused tests: `python -B -m unittest discover -s scripts/tests -p test_git_workspace.py`.
+They use only synthetic worktrees and local bare remotes; host qualification requires actual execution.
+
 ## Hosted Checks
 
 [actions/style/action.yml](actions/style/action.yml) accepts only `target-root`, `tool-cache`,

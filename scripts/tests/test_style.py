@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -27,6 +28,56 @@ SYNTHETIC_POLICY = {
 
 
 class StyleTextTest(unittest.TestCase):
+    def test_inventory_omits_deleted_tracked_paths_and_keeps_the_renamed_worktree_file(self):
+        git = Path(shutil.which("git"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kept = root / "kept.md"
+            removed = root / "removed.md"
+            marker = root / ".nojekyll"
+            kept.write_bytes(b"kept\n")
+            removed.write_bytes(b"renamed\n")
+            marker.write_bytes(b"")
+            for arguments in (
+                [git, "init", "--quiet"],
+                [git, "add", "--", "kept.md", "removed.md", ".nojekyll"],
+            ):
+                result = style.run_process(arguments, cwd=root)
+                self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+            removed.rename(root / "renamed.md")
+            (root / "new.py").write_bytes(b"value = 1\n")
+
+            eligible, excluded = style.inventory(root, git, SYNTHETIC_POLICY)
+
+            self.assertEqual({"kept.md", "renamed.md", "new.py"}, {item["path"] for item in eligible})
+            self.assertEqual([{"path": ".nojekyll", "reason": "Contractually empty marker"}], excluded)
+            self.assertFalse(removed.exists())
+            self.assertEqual(kept.read_bytes(), b"kept\n")
+
+    def test_python_without_terminator_uses_the_owning_lf_or_crlf_convention(self):
+        executables = style.verified_tools(TOOLS)
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=newline):
+                source = style.decode_text(b'"""operator tooling"""', newline)
+                formatted = style.format_text(
+                    OWNER_ROOT,
+                    {"formatter": "python", "path": "example.py"},
+                    source,
+                    TOOLS,
+                    executables,
+                )
+                self.assertEqual(formatted, '"""operator tooling"""' + newline)
+                self.assertEqual(
+                    style.format_text(
+                        OWNER_ROOT,
+                        {"formatter": "python", "path": "example.py"},
+                        style.decode_text(formatted.encode("utf-8"), newline),
+                        TOOLS,
+                        executables,
+                    ),
+                    formatted,
+                )
+
     def test_semantic_preservation_rejects_changed_values(self):
         for kind, original, formatted in (
             ("python", "value = 1\n", "value = 2\n"),
@@ -277,9 +328,12 @@ class StyleTextTest(unittest.TestCase):
 
             def transport(arguments, *, cwd, stdin=None):
                 if arguments[0] == Path("fake-git"):
-                    output = (
-                        b"sample.py\0plain.txt\0.nojekyll\0" if arguments[1] == "ls-files" else b"false\n"
-                    )
+                    if "--deleted" in arguments:
+                        output = b""
+                    else:
+                        output = (
+                            b"sample.py\0plain.txt\0.nojekyll\0" if arguments[1] == "ls-files" else b"false\n"
+                        )
                     return style.subprocess.CompletedProcess(arguments, 0, output, b"")
                 return runner(arguments, cwd=cwd, stdin=stdin)
 

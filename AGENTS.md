@@ -47,6 +47,17 @@ distinct. Avoid broad builds, benchmarks, native/live/device/capture/release run
 Preserve user edits. Remove the complete superseded dependency slice only within approved scope;
 no tombstones, compatibility aliases or historical archives for unused internal work.
 
+## Git Source Delivery
+
+`scripts/git_workspace.py` owns generic `review`, `apply`/`--dry-run` and `inspect` mechanics.
+Keep topology, approved paths/messages and original selections private and caller-owned; add no
+project-specific repository discovery or release action. Commit/push requires explicit approval
+and `--confirm`; all-target preflight and child-before-parent delivery preserve selected refs.
+Dry-run/inspection are read-only and never fetch. Stop on scope/ref drift or uncertain push outcomes,
+inspect the original intent and continue only explicitly; never force, replay blindly, reset or
+rewrite published history. Current controls stay in workspace Git administration and are removed
+only after successful completion, independently of required original records and existing tags.
+
 Repository creation, Git initialization/ref changes, commits/pushes, CI variables, source
 publication and parent submodule registration require their applicable separate approvals.
 This repo is not an app snapshot-tag member. It never authorizes signing, uploads, publication,

@@ -130,7 +130,14 @@ def inventory(root: Path, git: Path, policy: dict) -> tuple[list[dict], list[dic
     result = run_process([git, "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=root)
     if result.returncode:
         raise RuntimeError("Git source inventory failed")
-    paths = sorted(set(result.stdout.decode("utf-8").split("\0")) - {""})
+    deleted = run_process([git, "ls-files", "-z", "--deleted"], cwd=root)
+    if deleted.returncode:
+        raise RuntimeError("Git deleted-source inventory failed")
+    paths = sorted(
+        set(result.stdout.decode("utf-8").split("\0"))
+        - set(deleted.stdout.decode("utf-8").split("\0"))
+        - {""}
+    )
     config = run_process([git, "config", "--get", "core.autocrlf"], cwd=root)
     default_newline = "\r\n" if config.stdout.strip() == b"true" else "\n"
     eligible, excluded = [], []
@@ -350,6 +357,8 @@ def format_text(root: Path, item: dict, source: TextFile, tools: Path, executabl
             "--no-cache",
             "--config",
             str(confined_file(root, ".ruff.toml")),
+            "--config",
+            'format.line-ending="' + ("cr-lf" if source.newline == "\r\n" else "lf") + '"',
             "--stdin-filename",
             str(path),
             "-",
