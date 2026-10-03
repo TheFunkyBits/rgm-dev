@@ -1,0 +1,17 @@
+BasedOnStyle: LLVM
+Standard: c++17
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 110
+SortIncludes:
+  Enabled: false
+SortUsingDeclarations: Never
+QualifierAlignment: Leave
+BreakStringLiterals: false
+RawStringFormats: []
+ReflowComments: Never
+InsertBraces: false
+RemoveBracesLLVM: false
+RemoveParentheses: Leave
+RemoveSemicolon: false
+LineEnding: DeriveLF

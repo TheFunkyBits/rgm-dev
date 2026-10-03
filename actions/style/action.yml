@@ -1,0 +1,58 @@
+name: RGM source style
+description: Check target-owned source formatting and EOF with pinned developer tooling.
+inputs:
+  target-root:
+    description: Explicit target checkout under the workflow workspace.
+    required: true
+  tool-cache:
+    description: Separate formatter cache under the workspace or runner temporary directory.
+    required: true
+  smoke-root:
+    description: Target-relative directory containing style routing tests.
+    required: true
+  kotlin:
+    description: Exactly true for a Kotlin target, otherwise exactly false.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: "3.11"
+    - name: Validate style inputs
+      shell: pwsh
+      env:
+        RGM_STYLE_TARGET: ${{ inputs.target-root }}
+        RGM_STYLE_CACHE: ${{ inputs.tool-cache }}
+        RGM_STYLE_SMOKE: ${{ inputs.smoke-root }}
+        RGM_STYLE_KOTLIN: ${{ inputs.kotlin }}
+      run: python -B "$env:GITHUB_ACTION_PATH/../../scripts/hosted_style.py" validate
+    - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+      if: inputs.kotlin == 'true'
+      with:
+        distribution: temurin
+        java-version: "17"
+    - name: Set up pinned source formatters
+      shell: pwsh
+      env:
+        RGM_STYLE_TARGET: ${{ inputs.target-root }}
+        RGM_STYLE_CACHE: ${{ inputs.tool-cache }}
+        RGM_STYLE_SMOKE: ${{ inputs.smoke-root }}
+        RGM_STYLE_KOTLIN: ${{ inputs.kotlin }}
+      run: python -B "$env:GITHUB_ACTION_PATH/../../scripts/hosted_style.py" setup
+    - name: Test target style routing
+      shell: pwsh
+      env:
+        RGM_STYLE_TARGET: ${{ inputs.target-root }}
+        RGM_STYLE_CACHE: ${{ inputs.tool-cache }}
+        RGM_STYLE_SMOKE: ${{ inputs.smoke-root }}
+        RGM_STYLE_KOTLIN: ${{ inputs.kotlin }}
+      run: python -B "$env:GITHUB_ACTION_PATH/../../scripts/hosted_style.py" smoke
+    - name: Check all eligible source text
+      shell: pwsh
+      env:
+        RGM_STYLE_TARGET: ${{ inputs.target-root }}
+        RGM_STYLE_CACHE: ${{ inputs.tool-cache }}
+        RGM_STYLE_SMOKE: ${{ inputs.smoke-root }}
+        RGM_STYLE_KOTLIN: ${{ inputs.kotlin }}
+      run: python -B "$env:GITHUB_ACTION_PATH/../../scripts/hosted_style.py" check

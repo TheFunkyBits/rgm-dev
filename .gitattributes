@@ -1,0 +1,3 @@
+gradle-plugins/gradlew text eol=lf
+gradle-plugins/gradlew.bat text eol=crlf
+gradle-plugins/gradle/wrapper/gradle-wrapper.jar binary

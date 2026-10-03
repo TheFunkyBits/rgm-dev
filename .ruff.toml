@@ -1,0 +1,9 @@
+target-version = "py311"
+line-length = 110
+preview = false
+
+[format]
+quote-style = "preserve"
+indent-style = "space"
+line-ending = "auto"
+docstring-code-format = false

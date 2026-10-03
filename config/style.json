@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "protectedPaths": {
+    "LICENSE*": "Original legal material",
+    "NOTICE*": "Original legal material",
+    "gradle-plugins/gradlew": "Original Gradle launcher",
+    "gradle-plugins/gradlew.bat": "Original Gradle launcher",
+    "gradle-plugins/gradle/wrapper/**": "Original Gradle wrapper inputs",
+    "build/**": "Generated tooling outputs",
+    "**/build/**": "Generated build outputs"
+  },
+  "binaryExtensions": [".jar", ".zip", ".png", ".jpg", ".jpeg", ".webp", ".ico", ".woff", ".woff2"]
+}
