@@ -39,9 +39,32 @@ meaningful whitespace and exactly one final logical newline on eligible text; pr
 and contractual empty markers retain their owning exclusions. Follow local Git core.autocrlf
 and required file-specific exceptions. No manual EOL converters or raw-byte EOL/EOF gates.
 
+## Verification Timing
+
+Complete all authorized edits for the current task across every affected repository before
+running any build or test command. While any authorized edit remains unfinished, do not launch
+Gradle configuration/dry-runs, compilation, `testClasses`, assemble/test tasks, filtered tests,
+Python unittest/pytest, native CTest or custom smoke checks. A narrow/focused check, `--tests`
+filter, finished file/module/repository or convenient prerequisite is not early-run permission.
+Do not split the task or relabel a build/test as preflight, validation or diagnostics to bypass this rule.
+During editing, use targeted reads, source analysis, existing diagnostics and normal Git diff review;
+prepare regression tests and the final verification commands without executing them.
+
+After the edit phase, run the smallest required verification set, combining compatible tasks and
+serializing Gradle. Preserve valid unaffected evidence rather than repeat checks for freshness.
+If verification fails, retain the result, finish all related corrective edits, then rerun only
+invalidated checks and required dependency gates. This scheduling rule never waives required checks.
+Guidance-only changes use read-only content/diff review, not application builds/tests; expressly
+requested test-only work with no planned edits may proceed directly to verification.
+
+Higher-priority mandatory validation remains binding. Before an unavoidable early executable
+gate, disclose the exact conflicting requirement and why read-only/editor diagnostics cannot
+satisfy it; never silently use a generic mandatory-check exception or claim this policy overrides
+agent instructions.
+
 ## Verification And Change Scope
 
-Start with focused positive/negative synthetic tests for the changed contract. Prove actual
+Start final verification with focused positive/negative synthetic tests for the changed contract. Prove actual
 Windows/Linux outcomes before claiming them passed; unrun, failed and waived results remain
 distinct. Avoid broad builds, benchmarks, native/live/device/capture/release runs for reassurance.
 Preserve user edits. Remove the complete superseded dependency slice only within approved scope;
