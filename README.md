@@ -60,9 +60,25 @@ packets retain usable plugin source/licence/build inputs under `rgm-dev/`, not u
 
 ## Git Workspace Delivery
 
-[scripts/git_workspace.py](scripts/git_workspace.py) delivers explicitly reviewed source changes
-across independent worktrees. Use Python 3.11+, an absolute Git executable and an explicit workspace
-Git root. Keep the per-operation selection JSON outside the workspace and outside Git:
+[scripts/git_workspace.py](scripts/git_workspace.py) delivers approved source changes across independent
+worktrees. Use Python 3.11+, an absolute Git executable and an explicit workspace Git root. A caller-owned
+trusted policy supports one-call all-current delivery without a manually authored selection:
+
+```text
+python -B scripts/git_workspace.py apply --workspace <root> --policy <caller-policy.json> --git <absolute-git> --message "Update source" --confirm-all-current
+```
+
+The strict policy contains `repositories` and `protected`. Repository records declare `label`, relative
+`root`, credential-free canonical `remote` and `branch`; a final parent adds `gitlinks` and explicit
+`allowedPaths`. Protected records declare a selected `root` and exact `paths`. Topology, destinations
+and eligibility are private/caller-owned; this generic tool does not discover a project layout.
+Initial policy/launcher installation and protected authority updates use reviewed selection. All-current
+approval captures exact nonignored paths and HEADs internally, preserves staged-only content, and explicitly
+approves whole-current content for partial staging. It never absorbs later paths or unapproved outgoing
+commits. A safe no-op creates no empty commits, pushes or transaction control. Normal success reports
+verified current commits directly; separate review, dry-run and follow-up inspection are not prerequisites.
+
+The alternative reviewed-selection route keeps its per-operation JSON outside the workspace and Git:
 
 ```text
 python -B scripts/git_workspace.py review --workspace <root> --selection <external-json> --git <git-executable>
@@ -95,13 +111,18 @@ There is no implicit fetch, pull, rebase, reset, force push, tag push or deploym
 Normal Git line-ending handling remains in force. Dry-run is read-only and cannot prove hook
 success or future remote acceptance.
 
-Apply needs explicit commit/push authorization and `--confirm`. Pushes select the original commit
+Reviewed apply needs explicit commit/push authorization and `--confirm`; policy apply uses
+`--confirm-all-current`. Pushes select the original commit
 with a non-force branch refspec and `--no-follow-tags`. Stop on rejection, changed scope or lost
 acknowledgement; retain successful partial work and local commits. Original selection and minimal
-commit/push intent live privately in the workspace Git directory as `git-workspace-delivery.json`,
+commit/push intent and captured source/index state live privately in the workspace Git directory as `git-workspace-delivery.json`,
 with a process lock alongside it. Do not delete or alter this control to force a restart. Inspect
 first, resolve the reported condition, then explicitly continue with the unchanged selection.
-An already-observed original push is accepted without replay. Completion removes this operation's
+Policy recovery uses `inspect --policy <original-policy>` and, after inspection, `apply --continue
+--confirm-all-current --policy <original-policy>`, with no replacement message. Original selection and
+captured source/index state are retained; controls without sufficient captured state are inspect-only
+for any remaining commit creation. An already-observed original push is accepted without replay.
+Completion removes this operation's
 control, not independent records, tags or history. JSON outcomes go to stdout; sanitized failures
 go to stderr. Hooks and push-triggered source CI retain their owning behavior and approvals.
 

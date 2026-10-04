@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+import base64
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import json
 import os
@@ -35,6 +36,41 @@ def unique_object(pairs):
         require(key not in document, "Selection/control repeats a JSON field")
         document[key] = value
     return document
+
+
+def encode_baseline(snapshot):
+    return {
+        "head": snapshot["head"],
+        "index": base64.b64encode(snapshot["index"]).decode("ascii"),
+        "sources": {
+            path: base64.b64encode(source).decode("ascii") if source is not None else None
+            for path, source in snapshot["sources"].items()
+        },
+    }
+
+
+def decode_baseline(document):
+    require(
+        type(document) is dict and set(document) == {"head", "index", "sources"},
+        "Malformed captured source/index state",
+    )
+    require(
+        isinstance(document["head"], str) and REVISION.fullmatch(document["head"]), "Captured HEAD is invalid"
+    )
+    require(
+        isinstance(document["index"], str) and type(document["sources"]) is dict,
+        "Malformed captured index/source",
+    )
+    sources = {}
+    for path, source in document["sources"].items():
+        portable(path)
+        require(source is None or isinstance(source, str), "Captured source is malformed")
+        sources[path] = base64.b64decode(source, validate=True) if source is not None else None
+    return {
+        "head": document["head"],
+        "index": base64.b64decode(document["index"], validate=True),
+        "sources": sources,
+    }
 
 
 def canonical(path: Path, *, directory=False, exclusive=False):
@@ -208,6 +244,9 @@ class Workspace:
         self.root = canonical(workspace, directory=True)
         self.selection = selection
         self.git = git
+        self.policy = None
+        self.policy_path = None
+        self.captured_baselines = None
         require(
             type(selection) is dict and set(selection) == {"repositories"}, "Malformed workspace selection"
         )
@@ -294,6 +333,171 @@ class Workspace:
                         "Parent gitlink target differs from its selected child",
                     )
 
+    @classmethod
+    def from_policy(cls, workspace, document, git, message, policy_path=None):
+        require(isinstance(message, str) and message.strip(), "All-current delivery requires a message")
+        require(
+            type(document) is dict and set(document) == {"repositories", "protected"},
+            "Malformed source-delivery policy",
+        )
+        require(type(document["repositories"]) is list and document["repositories"], "No policy repositories")
+        selection = {"repositories": []}
+        eligibility = {}
+        for specification in document["repositories"]:
+            required = {"label", "root", "remote", "branch"}
+            require(
+                type(specification) is dict
+                and required <= set(specification) <= required | {"allowedPaths", "gitlinks"},
+                "Malformed policy repository",
+            )
+            require(
+                isinstance(specification["label"], str) and LABEL.fullmatch(specification["label"]),
+                "Policy repository label is invalid",
+            )
+            require(
+                isinstance(specification["branch"], str) and specification["branch"],
+                "Policy branch must be explicit",
+            )
+            relative = portable(specification["root"], root=True)
+            root = canonical(workspace if relative == "." else workspace / relative, directory=True)
+            entry = {name: specification[name] for name in required}
+            entry.update(
+                head=git.text(root, "rev-parse", "--verify", "HEAD"),
+                outgoing=[],
+                paths=[],
+                message=message,
+            )
+            if "gitlinks" in specification:
+                require(type(specification["gitlinks"]) is dict, "Malformed policy gitlinks")
+                entry["gitlinks"] = specification["gitlinks"]
+                entry["paths"] = [{"path": path, "stage": "worktree"} for path in entry["gitlinks"]]
+                require("allowedPaths" in specification, "Parent source eligibility must be explicit")
+            allowed = specification.get("allowedPaths")
+            require(allowed is None or type(allowed) is list, "Malformed source eligibility")
+            if allowed is not None:
+                for path in allowed:
+                    portable(path)
+                require(len(allowed) == len(set(allowed)), "Repeated source eligibility path")
+            eligibility[specification["label"]] = allowed
+            selection["repositories"].append(entry)
+        route = cls(workspace, selection, git)
+        route.policy = document
+        route.policy_path = policy_path
+        route.require_policy_inputs()
+        baselines = {}
+        for entry, repository in zip(selection["repositories"], route.repositories):
+            for change in route.status(repository):
+                for path in (change.path, change.original):
+                    if path is None or path in repository.gitlinks:
+                        continue
+                    allowed = eligibility[repository.label]
+                    require(allowed is None or path in allowed, "Current parent/source path is not eligible")
+                    mode = (
+                        "index"
+                        if change.index not in (" ", "?") and change.worktree == " "
+                        else "whole"
+                        if change.index not in (" ", "?")
+                        else "worktree"
+                    )
+                    repository.paths[path] = mode
+            entry["paths"] = [{"path": path, "stage": mode} for path, mode in repository.paths.items()]
+            route.validate_paths(repository, route.status(repository))
+            baselines[repository.label] = route.snapshot(repository)
+        route.captured_baselines = baselines
+        return route
+
+    def require_policy_inputs(self):
+        if self.policy_path is not None:
+            canonical(self.policy_path, exclusive=True)
+            current = json.loads(
+                self.policy_path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+            )
+            require(current == self.policy, "Source policy changed from its captured selection")
+        require(type(self.policy["protected"]) is list, "Malformed protected source inputs")
+        guarded = {}
+        for item in self.policy["protected"]:
+            require(type(item) is dict and set(item) == {"root", "paths"}, "Malformed protected source")
+            relative = portable(item["root"], root=True)
+            root = self.root if relative == "." else self.root / relative
+            require(root in {repository.root for repository in self.repositories}, "Unknown protected owner")
+            require(type(item["paths"]) is list, "Malformed protected paths")
+            guarded.setdefault(root, set()).update(portable(path) for path in item["paths"])
+        for repository in self.repositories:
+            if repository.gitlinks:
+                guarded.setdefault(repository.root, set()).add(".gitmodules")
+            if self.policy_path is not None and self.policy_path.is_relative_to(repository.root):
+                guarded.setdefault(repository.root, set()).add(
+                    self.policy_path.relative_to(repository.root).as_posix()
+                )
+            changed = {
+                path for change in self.status(repository) for path in (change.path, change.original) if path
+            }
+            require(
+                not changed & guarded.get(repository.root, set()),
+                "Policy/registration/source authority changed; use reviewed selection",
+            )
+
+    def require_destination(self, repository):
+        for arguments in (
+            ("remote", "get-url", "--all", "origin"),
+            ("remote", "get-url", "--push", "--all", "origin"),
+        ):
+            require(
+                self.git.text(repository.root, *arguments) == repository.remote,
+                "Git destination differs or has multiple URLs",
+            )
+        mirror = self.git.call(
+            repository.root, "config", "--get", "--bool", "remote.origin.mirror", allowed=(0, 1)
+        )
+        require(
+            mirror.returncode == 1
+            and not mirror.stdout
+            or mirror.returncode == 0
+            and mirror.stdout == b"false\n",
+            "Mirror Git destinations are prohibited",
+        )
+        require(
+            self.git.text(repository.root, "symbolic-ref", "--quiet", "--short", "HEAD") == repository.branch,
+            "Selected branch changed or is detached",
+        )
+
+    def require_registration(self, repository):
+        configured = self.git.call(
+            repository.root,
+            "config",
+            "--file",
+            ".gitmodules",
+            "-z",
+            "--get-regexp",
+            r"^submodule\..*\.(path|url)$",
+        ).stdout.decode("utf-8")
+        modules = {}
+        for record in configured.split("\0"):
+            if not record:
+                continue
+            key, value = record.split("\n", 1)
+            name, kind = key.rsplit(".", 1)
+            fields = modules.setdefault(name, {})
+            require(kind not in fields, "Registration repeats a path or URL")
+            fields[kind] = value
+        require(
+            all(set(fields) == {"path", "url"} for fields in modules.values()),
+            "Registration requires a path and canonical URL",
+        )
+        registered = {fields["path"]: fields["url"] for fields in modules.values()}
+        expected = {path: self.by_label[label].remote for path, label in repository.gitlinks.items()}
+        require(
+            len(registered) == len(modules) and registered == expected,
+            "Parent selection does not match registered child paths and destinations",
+        )
+        tracked = self.git.call(repository.root, "ls-files", "--stage", "-z").stdout.decode("utf-8")
+        modes = {
+            record.split("\t", 1)[1]: record.split(" ", 1)[0] for record in tracked.split("\0") if record
+        }
+        require(
+            all(modes.get(path) == "160000" for path in expected), "Registered child is not a tracked gitlink"
+        )
+
     def status(self, repository):
         return parse_status(
             self.git.call(
@@ -312,6 +516,7 @@ class Workspace:
             for change in changes
             if change.index == "D" and repository.paths.get(change.path) == "index"
         }
+        ignored_candidates = []
         for path in repository.paths:
             if path in index_deletions:
                 continue
@@ -323,10 +528,20 @@ class Workspace:
             if os.path.lexists(candidate):
                 canonical(candidate, directory=path in repository.gitlinks, exclusive=True)
             if path not in repository.gitlinks:
-                ignored = self.git.call(
-                    repository.root, "check-ignore", "--quiet", "--", path, allowed=(0, 1)
-                )
-                require(ignored.returncode == 1, "Ignored source is not eligible for Git delivery")
+                ignored_candidates.append(path)
+        if ignored_candidates:
+            ignored = self.git.call(
+                repository.root,
+                "check-ignore",
+                "--stdin",
+                "-z",
+                allowed=(0, 1),
+                stdin="".join(path + "\0" for path in ignored_candidates).encode("utf-8"),
+            )
+            require(
+                ignored.returncode == 1 and not ignored.stdout,
+                "Ignored source is not eligible for Git delivery",
+            )
         for change in changes:
             if change.index not in (" ", "?"):
                 require(
@@ -361,37 +576,27 @@ class Workspace:
         require(
             self.git.text(root, "rev-parse", "--verify", "HEAD") == expected_head, "Selected HEAD drifted"
         )
-        for arguments in (
-            ("remote", "get-url", "--all", "origin"),
-            ("remote", "get-url", "--push", "--all", "origin"),
-        ):
-            require(
-                self.git.text(root, *arguments) == repository.remote,
-                "Git destination differs or has multiple URLs",
-            )
-        mirror = self.git.call(root, "config", "--get", "--bool", "remote.origin.mirror", allowed=(0, 1))
-        require(
-            mirror.returncode == 1
-            and not mirror.stdout
-            or mirror.returncode == 0
-            and mirror.stdout == b"false\n",
-            "Mirror Git destinations are prohibited",
-        )
+        self.require_destination(repository)
         require(not self.git.call(root, "ls-files", "--unmerged", "-z").stdout, "Index conflicts remain")
-        for name in (
+        operation_names = (
             "MERGE_HEAD",
             "CHERRY_PICK_HEAD",
             "REVERT_HEAD",
             "rebase-merge",
             "rebase-apply",
             "sequencer",
-        ):
-            require(
-                not os.path.lexists(
-                    self.git.text(root, "rev-parse", "--path-format=absolute", "--git-path", name)
-                ),
-                "Another Git operation is in progress",
-            )
+        )
+        paths = self.git.text(
+            root,
+            "rev-parse",
+            "--path-format=absolute",
+            *(argument for name in operation_names for argument in ("--git-path", name)),
+        ).splitlines()
+        require(
+            len(paths) == len(operation_names) and all(Path(path).is_absolute() for path in paths),
+            "Git operation paths are ambiguous",
+        )
+        require(not any(os.path.lexists(path) for path in paths), "Another Git operation is in progress")
         remote = self.git.remote_head(repository)
         self.git.call(root, "cat-file", "-e", f"{remote}^{{commit}}")
         self.git.call(root, "merge-base", "--is-ancestor", remote, expected_head)
@@ -414,13 +619,7 @@ class Workspace:
         ):
             self.git.call(root, *arguments)
         if repository.gitlinks:
-            configured = self.git.call(
-                root, "config", "--file", ".gitmodules", "-z", "--get-regexp", r"^submodule\..*\.path$"
-            ).stdout.decode("utf-8")
-            leaves = {entry.split("\n", 1)[1] for entry in configured.split("\0") if entry}
-            require(
-                leaves == set(repository.gitlinks), "Parent selection does not match registered child paths"
-            )
+            self.require_registration(repository)
         return {
             "label": repository.label,
             "branch": repository.branch,
@@ -475,7 +674,9 @@ class Workspace:
         control = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
         require(
             type(control) is dict
-            and set(control) == {"selection", "repositories"}
+            and {"selection", "repositories"}
+            <= set(control)
+            <= {"selection", "repositories", "baselines", "policy"}
             and control["selection"] == self.selection,
             "Original operation selection differs; never reconstruct it",
         )
@@ -503,6 +704,35 @@ class Workspace:
                 and REVISION.fullmatch(value["commit"]),
                 "Original intended commit is invalid",
             )
+        if "baselines" in control:
+            require(
+                type(control["baselines"]) is dict and set(control["baselines"]) == set(self.by_label),
+                "Original captured state lacks selected repositories",
+            )
+            for baseline in control["baselines"].values():
+                decode_baseline(baseline)
+        if "policy" in control:
+            policy = control["policy"]
+            require(
+                type(policy) is dict and set(policy) == {"path", "document"},
+                "Original policy control is malformed",
+            )
+            require(
+                isinstance(policy["path"], str) and Path(policy["path"]).is_absolute(),
+                "Original policy path is invalid",
+            )
+            require(
+                type(policy["document"]) is dict and set(policy["document"]) == {"repositories", "protected"},
+                "Original caller policy is malformed",
+            )
+            if self.policy is not None:
+                require(
+                    policy["document"] == self.policy and policy["path"] == str(self.policy_path),
+                    "Policy differs from the original captured operation",
+                )
+            else:
+                self.policy = policy["document"]
+                self.policy_path = Path(policy["path"])
         return control
 
     def save_control(self, control, *, create=False):
@@ -553,13 +783,15 @@ class Workspace:
         }
 
     def verify_commit(self, repository, commit):
+        observed = self.git.text(repository.root, "show", "-s", "--format=%P%x00%B", commit)
+        require("\0" in observed, "Committed source metadata is ambiguous")
+        parent, message = observed.split("\0", 1)
         require(
-            self.git.text(repository.root, "show", "-s", "--format=%P", commit) == repository.head,
+            parent == repository.head,
             "New commit does not have its original selected parent",
         )
         require(
-            self.git.text(repository.root, "show", "-s", "--format=%B", commit)
-            == repository.message.rstrip("\n"),
+            message == repository.message.rstrip("\n"),
             "Commit message differs from the approved message",
         )
         changed = (
@@ -593,6 +825,19 @@ class Workspace:
         require(head == repository.head, "Selected HEAD drifted outside the recorded operation")
         return None
 
+    def captured_state(self, repository, control):
+        require("baselines" in control, "Original captured source/index is missing; inspect only")
+        return decode_baseline(control["baselines"][repository.label])
+
+    def require_commit_state(self, repository, commit, control):
+        if "baselines" not in control:
+            return
+        expected = self.captured_state(repository, control)
+        expected["head"] = commit
+        require(
+            self.snapshot(repository) == expected, "Source/index changed after the captured commit intent"
+        )
+
     def inspect(self):
         control = self.read_control()
         if control is None:
@@ -601,6 +846,8 @@ class Workspace:
         for repository in self.repositories:
             recorded = control["repositories"][repository.label]
             commit = self.observed_commit(repository, recorded)
+            if commit is not None:
+                self.require_commit_state(repository, commit, control)
             remote = self.git.remote_head(repository)
             status = (
                 "delivered"
@@ -680,6 +927,8 @@ class Workspace:
 
     def deliver(self, repository, control, baseline):
         recorded = control["repositories"][repository.label]
+        if self.policy is not None:
+            self.require_policy_inputs()
         self.require_children(repository, control)
         self.preflight(repository, recorded)
         require(self.snapshot(repository) == baseline, "Source/index changed concurrently before staging")
@@ -695,23 +944,28 @@ class Workspace:
                 self.sources(repository) == baseline["sources"], "Source changed concurrently during staging"
             )
             if changed:
+                staged_state = self.snapshot(repository)
+                control["baselines"][repository.label] = encode_baseline(staged_state)
                 recorded["phase"] = "commit-attempted"
                 self.save_control(control)
                 self.git.call(repository.root, "commit", "-m", repository.message)
                 commit = self.git.text(repository.root, "rev-parse", "HEAD")
                 self.verify_commit(repository, commit)
                 require(
-                    self.sources(repository) == baseline["sources"],
+                    self.sources(repository) == baseline["sources"]
+                    and self.snapshot(repository)["index"] == staged_state["index"],
                     "Source/hook changed during commit; inspect before push",
                 )
             else:
                 commit = repository.head
             recorded.update({"phase": "committed", "commit": commit})
+            control["baselines"][repository.label] = encode_baseline(self.snapshot(repository))
             self.save_control(control)
         require(
             self.git.text(repository.root, "rev-parse", "HEAD") == recorded["commit"],
             "Intended commit drifted before push",
         )
+        self.require_destination(repository)
         remote = self.git.remote_head(repository)
         if remote == recorded["commit"]:
             recorded["phase"] = (
@@ -736,7 +990,7 @@ class Workspace:
         recorded["phase"] = "pushed"
         self.save_control(control)
 
-    def apply(self, *, dry_run=False, continue_operation=False):
+    def apply(self, *, dry_run=False, continue_operation=False, lock_held=False):
         if dry_run:
             require(not continue_operation, "Dry-run must review a fresh selection")
             require(self.read_control() is None, "Original operation exists; inspect before continuation")
@@ -744,24 +998,66 @@ class Workspace:
             result["status"] = "dry-run"
             return result
         control_file = self.control_path()
-        with operation_lock(control_file.with_suffix(".lock")):
+        with nullcontext() if lock_held else operation_lock(control_file.with_suffix(".lock")):
             control = self.read_control()
             require(
                 (control is not None) == continue_operation,
                 "Use inspect and explicit continuation for an existing operation",
             )
+            if self.policy is not None:
+                self.require_policy_inputs()
             if control:
                 for repository in self.repositories:
                     recorded = control["repositories"][repository.label]
                     if recorded["phase"] == "commit-attempted":
                         commit = self.observed_commit(repository, recorded)
                         if commit:
+                            self.require_commit_state(repository, commit, control)
                             recorded.update({"phase": "committed", "commit": commit})
             reviewed = self.review(control["repositories"] if control else None)
-            baselines = {repository.label: self.snapshot(repository) for repository in self.repositories}
+            baselines = (
+                {
+                    repository.label: self.captured_state(repository, control)
+                    for repository in self.repositories
+                }
+                if control
+                else self.captured_baselines
+                or {repository.label: self.snapshot(repository) for repository in self.repositories}
+            )
+            if control:
+                for repository in self.repositories:
+                    commit = control["repositories"][repository.label]["commit"]
+                    if commit is not None:
+                        baselines[repository.label]["head"] = commit
+            for repository in self.repositories:
+                require(
+                    self.snapshot(repository) == baselines[repository.label],
+                    "Captured source/index changed before delivery",
+                )
+            if (
+                control is None
+                and self.policy is not None
+                and all(
+                    not self.status(repository) and not repository.outgoing
+                    for repository in self.repositories
+                )
+            ):
+                return {
+                    "status": "nothing-to-do",
+                    "repositories": [
+                        {
+                            "label": repository.label,
+                            "status": "skipped",
+                            "commit": repository.head,
+                            "remaining": [],
+                        }
+                        for repository in self.repositories
+                    ],
+                }
             if control is None:
                 control = {
                     "selection": self.selection,
+                    "baselines": {label: encode_baseline(baseline) for label, baseline in baselines.items()},
                     "repositories": {
                         value["label"]: {
                             "phase": "selected",
@@ -771,6 +1067,8 @@ class Workspace:
                         for value in reviewed["repositories"]
                     },
                 }
+                if self.policy is not None and self.policy_path is not None:
+                    control["policy"] = {"path": str(self.policy_path), "document": self.policy}
                 self.save_control(control, create=True)
             else:
                 self.save_control(control)
@@ -789,12 +1087,30 @@ class Workspace:
                     and self.git.text(repository.root, "rev-parse", "HEAD") == recorded["commit"],
                     "Delivered ref drifted before completion",
                 )
-                for path, label in repository.gitlinks.items():
-                    target = self.git.text(repository.root, "rev-parse", f"HEAD:{path}")
-                    require(
-                        target == control["repositories"][label]["commit"],
-                        "Parent gitlink does not select the delivered child commit",
-                    )
+                if repository.gitlinks:
+                    entries = self.git.call(
+                        repository.root,
+                        "ls-tree",
+                        "-rz",
+                        "--full-tree",
+                        "HEAD",
+                        "--",
+                        *repository.gitlinks,
+                    ).stdout.decode("utf-8")
+                    observed = {}
+                    for entry in entries.split("\0"):
+                        if entry:
+                            metadata, path = entry.split("\t", 1)
+                            mode, kind, target = metadata.split(" ")
+                            require(
+                                mode == "160000" and kind == "commit", "Parent selection is not a gitlink"
+                            )
+                            observed[path] = target
+                    expected = {
+                        path: control["repositories"][label]["commit"]
+                        for path, label in repository.gitlinks.items()
+                    }
+                    require(observed == expected, "Parent gitlink does not select the delivered child commit")
             result = {
                 "status": "delivered",
                 "repositories": [
@@ -811,17 +1127,89 @@ class Workspace:
             return result
 
 
-def main():
+def policy_command(arguments, git):
+    root = canonical(arguments.workspace, directory=True)
+    require(
+        Path(git.text(root, "rev-parse", "--show-toplevel")) == root, "Policy workspace is not its Git root"
+    )
+    policy_path = canonical(arguments.policy, exclusive=True)
+    document = json.loads(policy_path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    control_file = Path(
+        git.text(root, "rev-parse", "--path-format=absolute", "--git-path", "git-workspace-delivery.json")
+    )
+    canonical(control_file.parent, directory=True)
+
+    def selected_route():
+        if os.path.lexists(control_file):
+            canonical(control_file, exclusive=True)
+            original = json.loads(control_file.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+            require(
+                type(original) is dict and "selection" in original, "Original delivery control is malformed"
+            )
+            route = Workspace(root, original["selection"], git)
+            route.policy = document
+            route.policy_path = policy_path
+            return route
+        require(not arguments.continue_operation, "No original operation exists for continuation")
+        return Workspace.from_policy(
+            root, document, git, arguments.message or "Inspect current source", policy_path
+        )
+
+    if arguments.operation == "inspect":
+        return selected_route().inspect()
+    if arguments.operation == "review" or arguments.dry_run:
+        require(not arguments.continue_operation, "Preview never continues a mutation")
+        route = selected_route()
+        return route.review() if arguments.operation == "review" else route.apply(dry_run=True)
+    with operation_lock(control_file.with_suffix(".lock")):
+        route = selected_route()
+        return route.apply(continue_operation=arguments.continue_operation, lock_held=True)
+
+
+def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=("review", "apply", "inspect"))
     parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--selection", type=Path, required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--selection", type=Path)
+    inputs.add_argument("--policy", type=Path)
     parser.add_argument("--git", type=Path, required=True)
+    parser.add_argument("--message")
+    parser.add_argument("--confirm-all-current", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--continue", dest="continue_operation", action="store_true")
     parser.add_argument("--confirm", action="store_true")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(arguments)
     try:
+        if arguments.policy is not None:
+            require(not arguments.confirm, "Policy delivery uses explicit all-current approval")
+            if arguments.operation != "apply":
+                require(
+                    not (arguments.dry_run or arguments.continue_operation or arguments.confirm_all_current),
+                    "Read-only operations reject mutation options",
+                )
+            else:
+                require(
+                    arguments.dry_run or arguments.confirm_all_current,
+                    "Explicit --confirm-all-current is required",
+                )
+                require(
+                    arguments.continue_operation
+                    or isinstance(arguments.message, str)
+                    and arguments.message.strip(),
+                    "All-current delivery requires a commit message",
+                )
+            require(
+                not arguments.continue_operation or arguments.message is None,
+                "Continuation uses its original message",
+            )
+            result = policy_command(arguments, Git(arguments.git))
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        require(
+            not arguments.confirm_all_current and arguments.message is None,
+            "Reviewed selection already supplies exact paths and messages",
+        )
         selected = canonical(arguments.selection, exclusive=True)
         require(
             not selected.is_relative_to(arguments.workspace.resolve()),

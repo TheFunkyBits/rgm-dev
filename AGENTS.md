@@ -49,12 +49,18 @@ no tombstones, compatibility aliases or historical archives for unused internal 
 
 ## Git Source Delivery
 
-`scripts/git_workspace.py` owns generic `review`, `apply`/`--dry-run` and `inspect` mechanics.
-Keep topology, approved paths/messages and original selections private and caller-owned; add no
-project-specific repository discovery or release action. Commit/push requires explicit approval
-and `--confirm`; all-target preflight and child-before-parent delivery preserve selected refs.
+`scripts/git_workspace.py` owns generic reviewed-selection and policy-based one-call delivery,
+optional `review`/`--dry-run`, and `inspect` mechanics. Keep topology, trusted destinations, source
+eligibility and protected authority private and caller-owned; add no project-specific discovery or
+release action. Reviewed commit/push uses `--confirm`; policy delivery uses a message and explicit
+`--confirm-all-current`, including whole-current partial staging but excluding later scope and
+unapproved outgoing commits. Policy/registration/launcher authority changes use reviewed selection.
+All-target preflight and child-before-parent delivery preserve selected refs. The routine route captures
+selection internally and returns final observations; do not impose external selection creation,
+separate review/dry-run or stale post-completion inspection as normal-success prerequisites.
 Dry-run/inspection are read-only and never fetch. Stop on scope/ref drift or uncertain push outcomes,
-inspect the original intent and continue only explicitly; never force, replay blindly, reset or
+inspect original intent and captured source/index state, then continue only explicitly without
+regenerating scope or adopting later edits; never force, replay blindly, reset or
 rewrite published history. Current controls stay in workspace Git administration and are removed
 only after successful completion, independently of required original records and existing tags.
 

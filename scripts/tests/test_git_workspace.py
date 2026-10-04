@@ -38,6 +38,8 @@ class GitWorkspaceTest(unittest.TestCase):
         self.command(root, "config", "user.name", "Synthetic Git Operator")
         self.command(root, "config", "user.email", "operator@example.invalid")
         self.command(root, "config", "core.autocrlf", "false")
+        self.command(root, "config", "maintenance.auto", "false")
+        self.command(root, "config", "gc.auto", "0")
         (root / "source.txt").write_text("original\n", encoding="utf-8", newline="\n")
         self.command(root, "add", "--", "source.txt")
         self.command(root, "commit", "--quiet", "-m", "synthetic initial source")
@@ -64,6 +66,8 @@ class GitWorkspaceTest(unittest.TestCase):
         self.command(root, "config", "user.name", "Synthetic Git Operator")
         self.command(root, "config", "user.email", "operator@example.invalid")
         self.command(root, "config", "core.autocrlf", "false")
+        self.command(root, "config", "maintenance.auto", "false")
+        self.command(root, "config", "gc.auto", "0")
         remote = self.base / "parent.git"
         self.command(self.base, "init", "--quiet", "--bare", str(remote))
         modules = "".join(
@@ -98,6 +102,348 @@ class GitWorkspaceTest(unittest.TestCase):
         }
         self.selection["repositories"].append(entry)
         return entry
+
+    def policy(self):
+        repositories = []
+        for entry in self.selection["repositories"]:
+            specification = {name: entry[name] for name in ("label", "root", "remote", "branch")}
+            if entry.get("gitlinks"):
+                specification["gitlinks"] = entry["gitlinks"]
+                specification["allowedPaths"] = ["parent.txt"]
+            repositories.append(specification)
+        return {"repositories": repositories, "protected": []}
+
+    def test_policy_captures_current_paths_and_explicit_whole_staging_without_a_selection_file(self):
+        root, entry = self.repository("child")
+        (root / ".gitignore").write_text("ignored.txt\n", encoding="utf-8", newline="\n")
+        (root / "ignored.txt").write_text("private ignored input\n", encoding="utf-8", newline="\n")
+        (root / "source.txt").write_text("staged\n", encoding="utf-8", newline="\n")
+        self.command(root, "add", "--", "source.txt")
+        (root / "source.txt").write_text("whole current\n", encoding="utf-8", newline="\n")
+        (root / "new source.txt").write_text("new\n", encoding="utf-8", newline="\n")
+
+        route = delivery.Workspace.from_policy(
+            self.workspace, self.policy(), self.git, "Capture current source"
+        )
+
+        self.assertEqual(route.repositories[0].head, entry["head"])
+        self.assertEqual(route.repositories[0].paths["source.txt"], "whole")
+        self.assertEqual(route.repositories[0].paths["new source.txt"], "worktree")
+        self.assertNotIn("ignored.txt", route.repositories[0].paths)
+        self.assertEqual(route.repositories[0].outgoing, [])
+        self.assertEqual(route.repositories[0].message, "Capture current source")
+
+    def test_policy_refuses_unknown_parent_source_and_modified_registration(self):
+        root, _ = self.repository("child")
+        self.parent(["child"])
+        (self.workspace / "unknown.txt").write_text("not eligible\n", encoding="utf-8", newline="\n")
+        with self.assertRaisesRegex(delivery.DeliveryError, "not eligible"):
+            delivery.Workspace.from_policy(self.workspace, self.policy(), self.git, "Capture source")
+        (self.workspace / "unknown.txt").unlink()
+        modules = self.workspace / ".gitmodules"
+        modules.write_text(modules.read_text(encoding="utf-8") + "\n", encoding="utf-8", newline="\n")
+        with self.assertRaisesRegex(delivery.DeliveryError, "authority changed"):
+            delivery.Workspace.from_policy(self.workspace, self.policy(), self.git, "Capture source")
+
+    def test_one_policy_cli_call_captures_and_delivers_without_preparatory_commands(self):
+        root, _ = self.repository("child")
+        (root / "source.txt").write_text("one call\n", encoding="utf-8", newline="\n")
+        policy = self.base / "caller-policy.json"
+        policy.write_text(json.dumps(self.policy()), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                delivery.__file__,
+                "apply",
+                "--workspace",
+                str(self.workspace),
+                "--policy",
+                str(policy),
+                "--git",
+                str(self.executable),
+                "--message",
+                "One-call source",
+                "--confirm-all-current",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "delivered")
+        self.assertEqual(report["repositories"][0]["commit"], self.command(root, "rev-parse", "HEAD"))
+        self.assertEqual(self.command(root, "show", "HEAD:source.txt"), "one call")
+        self.assertFalse(self.route().control_path().exists())
+
+    def test_policy_capture_rejects_source_drift_during_initial_preflight(self):
+        root, _ = self.repository("child")
+        (root / "source.txt").write_text("captured\n", encoding="utf-8", newline="\n")
+        invoked = []
+
+        def concurrent(arguments, **kwargs):
+            if "ls-remote" in arguments and not invoked:
+                invoked.append(True)
+                (root / "source.txt").write_text("changed after capture\n", encoding="utf-8", newline="\n")
+            return subprocess.run(arguments, **kwargs)
+
+        git = delivery.Git(self.executable, runner=concurrent)
+        route = delivery.Workspace.from_policy(self.workspace, self.policy(), git, "Frozen source")
+        with self.assertRaisesRegex(delivery.DeliveryError, "Captured source/index changed"):
+            route.apply()
+        self.assertFalse(route.control_path().exists())
+
+    def test_policy_parent_delivery_checks_registration_urls_modes_and_parent_order(self):
+        root, _ = self.repository("child")
+        self.parent(["child"])
+        (root / "source.txt").write_text("child change\n", encoding="utf-8", newline="\n")
+        (self.workspace / "parent.txt").write_text("parent change\n", encoding="utf-8", newline="\n")
+        route = delivery.Workspace.from_policy(self.workspace, self.policy(), self.git, "One-call parent")
+
+        result = route.apply()
+
+        child_commit = result["repositories"][0]["commit"]
+        self.assertEqual(self.command(self.workspace, "rev-parse", "HEAD:child"), child_commit)
+        self.assertEqual(result["repositories"][-1]["status"], "pushed")
+
+    def test_policy_noop_avoids_transaction_control_commits_and_pushes(self):
+        self.repository("child")
+        calls = []
+
+        def observe(arguments, **kwargs):
+            calls.append(arguments)
+            return subprocess.run(arguments, **kwargs)
+
+        route = delivery.Workspace.from_policy(
+            self.workspace, self.policy(), delivery.Git(self.executable, runner=observe), "No changes"
+        )
+        self.assertEqual(route.apply()["status"], "nothing-to-do")
+        self.assertFalse(route.control_path().exists())
+        self.assertFalse(any("commit" in arguments or "push" in arguments for arguments in calls))
+
+    def test_policy_rejects_outgoing_commits_and_commit_hook_destination_drift(self):
+        root, entry = self.repository("child")
+        (root / "source.txt").write_text("unapproved outgoing\n", encoding="utf-8", newline="\n")
+        self.command(root, "add", "--", "source.txt")
+        self.command(root, "commit", "--quiet", "-m", "Existing unapproved commit")
+        route = delivery.Workspace.from_policy(self.workspace, self.policy(), self.git, "Current source")
+        with self.assertRaisesRegex(delivery.DeliveryError, "Outgoing commits"):
+            route.apply()
+        self.command(root, "push", "--quiet", "--no-follow-tags", "origin", "HEAD:refs/heads/main")
+        (root / "source.txt").write_text("new current change\n", encoding="utf-8", newline="\n")
+        pushes = []
+
+        def hook(arguments, **kwargs):
+            result = subprocess.run(arguments, **kwargs)
+            if "commit" in arguments:
+                self.command(
+                    root, "remote", "set-url", "--push", "origin", "https://example.invalid/wrong.git"
+                )
+            if "push" in arguments:
+                pushes.append(arguments)
+            return result
+
+        route = delivery.Workspace.from_policy(
+            self.workspace, self.policy(), delivery.Git(self.executable, runner=hook), "Guard destinations"
+        )
+        with self.assertRaisesRegex(delivery.DeliveryError, "destination differs"):
+            route.apply()
+        self.assertEqual(pushes, [])
+
+    def test_policy_continuation_uses_original_scope_and_refuses_later_source_edits(self):
+        root, _ = self.repository("first")
+        other, _ = self.repository("second")
+        (root / "source.txt").write_text("first captured\n", encoding="utf-8", newline="\n")
+        (other / "source.txt").write_text("second captured\n", encoding="utf-8", newline="\n")
+        policy = self.base / "recovery-policy.json"
+        policy.write_text(json.dumps(self.policy()), encoding="utf-8")
+        failed = []
+
+        def interrupt(arguments, **kwargs):
+            if "push" in arguments and not failed:
+                failed.append(True)
+                return subprocess.CompletedProcess(arguments, 1, b"", b"synthetic interruption")
+            return subprocess.run(arguments, **kwargs)
+
+        route = delivery.Workspace.from_policy(
+            self.workspace,
+            self.policy(),
+            delivery.Git(self.executable, runner=interrupt),
+            "Original scope",
+            policy,
+        )
+        with self.assertRaisesRegex(delivery.DeliveryError, "Git push failed"):
+            route.apply()
+        original = json.loads(route.control_path().read_text(encoding="utf-8"))
+        (other / "source.txt").write_text("later unapproved\n", encoding="utf-8", newline="\n")
+        recovery = delivery.Workspace(self.workspace, original["selection"], self.git)
+        with self.assertRaisesRegex(delivery.DeliveryError, "Captured source/index changed"):
+            recovery.apply(continue_operation=True)
+        self.assertEqual(
+            self.command(other, "rev-parse", "HEAD"), original["selection"]["repositories"][1]["head"]
+        )
+        self.assertTrue(route.control_path().exists())
+
+    def test_index_only_hook_content_change_stops_before_push(self):
+        root, entry = self.repository("child")
+        (root / "source.txt").write_text("captured index\n", encoding="utf-8", newline="\n")
+        self.command(root, "add", "--", "source.txt")
+        entry["paths"] = [{"path": "source.txt", "stage": "index"}]
+        injected = root / "injected.txt"
+        injected.write_text("unapproved hook index\n", encoding="utf-8", newline="\n")
+        blob = self.command(root, "hash-object", "-w", "--", "injected.txt")
+        injected.unlink()
+        pushes = []
+
+        def hook(arguments, **kwargs):
+            if "commit" in arguments:
+                self.command(root, "update-index", "--cacheinfo", f"100644,{blob},source.txt")
+            if "push" in arguments:
+                pushes.append(arguments)
+            return subprocess.run(arguments, **kwargs)
+
+        route = self.route(git=delivery.Git(self.executable, runner=hook))
+        with self.assertRaisesRegex(delivery.DeliveryError, "Source/hook changed"):
+            route.apply()
+        self.assertEqual(pushes, [])
+        with self.assertRaisesRegex(delivery.DeliveryError, "captured commit intent"):
+            route.inspect()
+
+    def test_policy_batches_local_checks_without_removing_remote_mutation_boundaries(self):
+        root, _ = self.repository("child")
+        self.parent(["child"])
+        for name in ("source.txt", "other.txt", "literal [path].txt"):
+            (root / name).write_text("captured current source\n", encoding="utf-8", newline="\n")
+        calls = []
+
+        def observe(arguments, **kwargs):
+            calls.append(arguments)
+            return subprocess.run(arguments, **kwargs)
+
+        route = delivery.Workspace.from_policy(
+            self.workspace,
+            self.policy(),
+            delivery.Git(self.executable, runner=observe),
+            "Subject\n\nMultiline body",
+        )
+        result = route.apply()
+
+        self.assertEqual(result["status"], "delivered")
+        ignores = [arguments for arguments in calls if "check-ignore" in arguments]
+        self.assertEqual(len(ignores), 4)
+        self.assertTrue(all("--stdin" in arguments and "-z" in arguments for arguments in ignores))
+        markers = [arguments for arguments in calls if "MERGE_HEAD" in arguments]
+        self.assertEqual(len(markers), 4)
+        self.assertTrue(all("sequencer" in arguments and "REVERT_HEAD" in arguments for arguments in markers))
+        metadata = [arguments for arguments in calls if "show" in arguments]
+        self.assertEqual(len(metadata), 2)
+        self.assertTrue(all("--format=%P%x00%B" in arguments for arguments in metadata))
+        remote_checks = [arguments for arguments in calls if "ls-remote" in arguments]
+        self.assertEqual(len(remote_checks), 11)
+        self.assertEqual(sum("ls-tree" in arguments for arguments in calls), 1)
+        self.assertEqual(self.command(root, "show", "-s", "--format=%B"), "Subject\n\nMultiline body")
+
+    def test_policy_captures_renames_and_deletions_without_absorbing_later_new_paths(self):
+        root, _ = self.repository("child")
+        self.command(root, "mv", "--", "source.txt", "renamed source.txt")
+        (root / "deleted.txt").write_text("delete this\n", encoding="utf-8", newline="\n")
+        self.command(root, "add", "--", "deleted.txt")
+        self.command(root, "commit", "--quiet", "-m", "Prepared synthetic rename and deletion")
+        self.command(root, "push", "--quiet", "--no-follow-tags", "origin", "HEAD:refs/heads/main")
+        self.command(root, "mv", "--", "renamed source.txt", "caf\u00e9 [literal].txt")
+        (root / "deleted.txt").unlink()
+        route = delivery.Workspace.from_policy(
+            self.workspace, self.policy(), self.git, "Captured file operations"
+        )
+        self.assertEqual(route.repositories[0].paths["caf\u00e9 [literal].txt"], "index")
+        self.assertIn("renamed source.txt", route.repositories[0].paths)
+        self.assertIn("deleted.txt", route.repositories[0].paths)
+        (root / "later.txt").write_text("not part of original capture\n", encoding="utf-8", newline="\n")
+
+        result = route.apply()
+
+        self.assertEqual(result["repositories"][0]["remaining"], ["later.txt"])
+        self.assertEqual(
+            self.command(root, "ls-tree", "--name-only", "-z", "HEAD"), "caf\u00e9 [literal].txt\0"
+        )
+
+    def test_legacy_selection_control_is_inspectable_but_cannot_reconstruct_uncaptured_commits(self):
+        root, entry = self.repository("child")
+        (root / "source.txt").write_text("pending source\n", encoding="utf-8", newline="\n")
+        entry["paths"] = [{"path": "source.txt", "stage": "worktree"}]
+        route = self.route()
+        control = {
+            "selection": self.selection,
+            "repositories": {"child": {"phase": "selected", "remoteBefore": entry["head"], "commit": None}},
+        }
+        route.control_path().write_text(json.dumps(control), encoding="utf-8")
+        self.assertEqual(route.inspect()["repositories"][0]["status"], "commit-not-observed")
+        with self.assertRaisesRegex(delivery.DeliveryError, "captured source/index is missing"):
+            route.apply(continue_operation=True)
+        self.assertEqual(self.command(root, "rev-parse", "HEAD"), entry["head"])
+
+    def test_policy_recovery_keeps_original_intent_after_lost_ack_and_rejects_replacement_policy(self):
+        root, _ = self.repository("child")
+        (root / "source.txt").write_text("original delivered scope\n", encoding="utf-8", newline="\n")
+        policy = self.base / "original-policy.json"
+        policy.write_text(json.dumps(self.policy()), encoding="utf-8")
+        pushes = []
+
+        def lose_ack(arguments, **kwargs):
+            result = subprocess.run(arguments, **kwargs)
+            if "push" in arguments:
+                pushes.append(arguments)
+                return subprocess.CompletedProcess(arguments, 1, b"", b"lost acknowledgement")
+            return result
+
+        route = delivery.Workspace.from_policy(
+            self.workspace,
+            self.policy(),
+            delivery.Git(self.executable, runner=lose_ack),
+            "Original approval",
+            policy,
+        )
+        with self.assertRaisesRegex(delivery.DeliveryError, "Git push failed"):
+            route.apply()
+        original = json.loads(route.control_path().read_text(encoding="utf-8"))
+        replacement = delivery.Workspace(self.workspace, original["selection"], self.git)
+        replacement.policy = {**self.policy(), "protected": [{"root": "child", "paths": ["source.txt"]}]}
+        replacement.policy_path = policy
+        with self.assertRaisesRegex(delivery.DeliveryError, "Policy differs"):
+            replacement.inspect()
+        recovered = delivery.Workspace(self.workspace, original["selection"], self.git)
+        self.assertEqual(recovered.inspect()["repositories"][0]["status"], "delivered")
+        self.assertEqual(recovered.apply(continue_operation=True)["status"], "delivered")
+        self.assertEqual(len(pushes), 1)
+
+    def test_policy_and_registration_drift_are_refused_before_mutation(self):
+        root, _ = self.repository("child")
+        self.parent(["child"])
+        (root / "source.txt").write_text("selected\n", encoding="utf-8", newline="\n")
+        policy = self.base / "policy.json"
+        policy.write_text(json.dumps(self.policy()), encoding="utf-8")
+        route = delivery.Workspace.from_policy(
+            self.workspace, self.policy(), self.git, "Approved scope", policy
+        )
+        policy.write_text(
+            json.dumps({**self.policy(), "protected": [{"root": ".", "paths": ["parent.txt"]}]}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(delivery.DeliveryError, "policy changed"):
+            route.apply()
+        self.assertFalse(route.control_path().exists())
+        policy.write_text(json.dumps(self.policy()), encoding="utf-8")
+        wrong = copy.deepcopy(self.policy())
+        wrong["repositories"][0]["remote"] = "https://example.invalid/wrong.git"
+        wrong_route = delivery.Workspace.from_policy(self.workspace, wrong, self.git, "Wrong registration")
+        with self.assertRaises(delivery.DeliveryError):
+            wrong_route.apply()
+        malformed = copy.deepcopy(self.policy())
+        malformed["repositories"][-1]["allowedPaths"] = [{}]
+        with self.assertRaises(delivery.DeliveryError):
+            delivery.Workspace.from_policy(self.workspace, malformed, self.git, "Malformed eligibility")
 
     def test_status_preserves_spaces_unicode_and_both_rename_endpoints(self):
         changes = delivery.parse_status("R  new name.txt\0old name.txt\0?? caf\u00e9.py\0".encode("utf-8"))
