@@ -25,9 +25,11 @@ coordinates, not framebuffer images. No vault-capable public runners or unapprov
 Use Python 3.11+ standard-library orchestration and JDK 17 with the owning checked-in wrapper.
 On Windows invoke `org.gradle.wrapper.GradleWrapperMain` directly, never batch commands in persistent
 terminals. Validate executable paths and pass argument arrays without shell interpretation. Run
-one-shots synchronously without timeout, serialize Gradle, and track background work through exit;
-no polling, interactive elevation, tool acquisition, or host installation during checks. Keep commands
-on one physical line and complex PowerShell in temporary scripts.
+one-shots synchronously without timeout and track background work through exit. Serialize Gradle
+unless an explicitly adopted consumer-owned session route protects independent mutable build roots;
+sharing this source as an included build also shares its outputs. Initial concurrency needs an
+approved scoped qualification. No polling, interactive elevation, tool acquisition, or host installation
+during checks. Keep commands on one physical line and complex PowerShell in temporary scripts.
 
 ## Tool Contracts
 
