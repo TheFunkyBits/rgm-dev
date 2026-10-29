@@ -44,6 +44,16 @@ and one final logical newline on eligible text; protected originals and contract
 keep their exclusions. Follow local Git configuration/file exceptions and inspect with `git ls-files
 --eol`, `git check-attr`, and `git diff --check`, not manual conversions or raw-byte EOL/EOF gates.
 
+## Editing Worktrees
+
+Ordinary AI source, documentation and configuration edits require an owned registered linked
+worktree and a unique feature branch per edited repository. Canonical checkouts are read-only
+except for an explicitly authorized serialized integration/delivery owner. Read-only research
+needs no worktree; editing-only work needs no SDK or runtime bootstrap. Consumer-owned session
+routes select related repository sets and own their mutable included-build/output resources.
+Retain applicable Git/registration approvals, shared-resource leases and original custody;
+worktrees are not a sandbox or permission to overwrite another owner.
+
 ## Verification Timing
 
 Finish all authorized edits across affected repositories before any build/test, including configuration,
