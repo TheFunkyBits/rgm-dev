@@ -15,7 +15,7 @@ not copied engines or cross-repository imported utilities. Keep implementations 
 
 Keep GPL-2.0-or-later obligations and original licence/source custody. Owner-approved private inputs
 remain with their owners; never copy Title data, private fixtures/allowlists, raw installations,
-player/operational saves/captures, vault contents, credentials, machine/device/account state, or
+user/operational saves/captures, vault contents, credentials, machine/device/account state, or
 operation records into public source, logs, CI, or artifacts. Never upload private material to third
 parties or pass secrets through the model. Failure artifacts may contain text, memory values, and
 coordinates, not framebuffer images. No vault-capable public runners or unapproved publication.
