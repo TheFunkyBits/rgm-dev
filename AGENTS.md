@@ -51,7 +51,11 @@ worktree and a unique feature branch per edited repository. Canonical checkouts 
 except for an explicitly authorized serialized integration/delivery owner. Read-only research
 needs no worktree; editing-only work needs no SDK or runtime bootstrap. Consumer-owned session
 routes select related repository sets and own their mutable included-build/output resources.
-Retain applicable Git/registration approvals, shared-resource leases and original custody;
+When the caller has granted standing create-only session setup approval, automatically create
+the needed local feature branches and registered worktrees within its approved layout without
+asking again. Validate repository/base identity and confined vacant destinations; choose fresh
+names on collision. This includes necessary local registration metadata, not other Git actions
+or runtime setup. Retain shared-resource leases, original custody and separate cleanup/delivery approvals;
 worktrees are not a sandbox or permission to overwrite another owner.
 
 ## Verification Timing
