@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field
 import json
 import os
-from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
-
 
 REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
@@ -228,7 +227,7 @@ def operation_lock(path):
 
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            raise DeliveryError("Another Git delivery operation holds the lock") from None
+            raise DeliveryError("Another Git integration/delivery operation holds the lock") from None
         try:
             yield
         finally:
@@ -237,6 +236,70 @@ def operation_lock(path):
                 msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def git_identity(git, root):
+    canonical(root, directory=True)
+    require(
+        Path(git.text(root, "rev-parse", "--show-toplevel")) == root,
+        "Selected path is not a Git worktree root",
+    )
+    common = canonical(
+        Path(git.text(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve(strict=True),
+        directory=True,
+    )
+    registered = git.call(root, "worktree", "list", "--porcelain", "-z").stdout.decode("utf-8").split("\0")
+    require(
+        sum(field == "worktree " + root.as_posix() for field in registered) == 1,
+        "Selected worktree has no unique registration",
+    )
+    return common
+
+
+def policy_roots(root, document):
+    require(
+        type(document) is dict and set(document) == {"repositories", "protected"},
+        "Malformed source-delivery policy",
+    )
+    require(type(document["repositories"]) is list and document["repositories"], "No policy repositories")
+    result = [root]
+    for specification in document["repositories"]:
+        require(type(specification) is dict and "root" in specification, "Malformed policy repository")
+        relative = portable(specification["root"], root=True)
+        selected = root if relative == "." else root / relative
+        require(selected.resolve(strict=True).is_relative_to(root), "Policy repository escapes workspace")
+        result.append(canonical(selected, directory=True))
+    return result
+
+
+@contextmanager
+def git_guard(git, roots, allowed_control=None):
+    identities = {root: git_identity(git, root) for root in roots}
+    common_stores = sorted(set(identities.values()), key=lambda path: os.path.normcase(str(path)))
+    with ExitStack() as stack:
+        for common in common_stores:
+            try:
+                stack.enter_context(operation_lock(common / "git-workspace-delivery.lock"))
+            except DeliveryError as error:
+                raise DeliveryError(f"Git repository {common}: {error}") from error
+        require(
+            all(git_identity(git, root) == common for root, common in identities.items()),
+            "Git registration/common-store identity changed before capture",
+        )
+        for common in common_stores:
+            administrations = [common]
+            linked = common / "worktrees"
+            if linked.exists():
+                canonical(linked, directory=True)
+                administrations += [canonical(path, directory=True) for path in linked.iterdir()]
+            for administration in administrations:
+                for name in ("git-workspace-delivery.json", "git-workspace-integration.json"):
+                    control = administration / name
+                    require(
+                        control == allowed_control or not os.path.lexists(control),
+                        "An original Git operation is pending; inspect its owner before continuing",
+                    )
+        yield
 
 
 class Workspace:
@@ -998,7 +1061,8 @@ class Workspace:
             result["status"] = "dry-run"
             return result
         control_file = self.control_path()
-        with nullcontext() if lock_held else operation_lock(control_file.with_suffix(".lock")):
+        roots = [self.root, *(repository.root for repository in self.repositories)]
+        with nullcontext() if lock_held else git_guard(self.git, roots, control_file):
             control = self.read_control()
             require(
                 (control is not None) == continue_operation,
@@ -1161,18 +1225,469 @@ def policy_command(arguments, git):
         require(not arguments.continue_operation, "Preview never continues a mutation")
         route = selected_route()
         return route.review() if arguments.operation == "review" else route.apply(dry_run=True)
-    with operation_lock(control_file.with_suffix(".lock")):
+    with git_guard(git, policy_roots(root, document), control_file):
         route = selected_route()
         return route.apply(continue_operation=arguments.continue_operation, lock_held=True)
 
 
+class Integration(Workspace):
+    def __init__(self, workspace, selection, git, policy, policy_path):
+        require(
+            type(selection) is dict and set(selection) == {"repositories"}, "Malformed integration selection"
+        )
+        require(
+            type(selection["repositories"]) is list and selection["repositories"],
+            "No integration repositories",
+        )
+        stripped = {"repositories": []}
+        sources = {}
+        for entry in selection["repositories"]:
+            require(
+                type(entry) is dict
+                and "source" in entry
+                and isinstance(entry.get("label"), str)
+                and LABEL.fullmatch(entry["label"]),
+                "Integration requires an explicit source selection and valid repository label",
+            )
+            sources[entry["label"]] = entry["source"]
+            stripped["repositories"].append({key: value for key, value in entry.items() if key != "source"})
+        super().__init__(workspace, stripped, git)
+        self.selection = selection
+        self.policy = policy
+        self.policy_path = policy_path
+        policy_roots(self.root, policy)
+        require(type(policy["protected"]) is list, "Malformed protected source inputs")
+        for guarded in policy["protected"]:
+            require(type(guarded) is dict and set(guarded) == {"root", "paths"}, "Malformed protected source")
+            portable(guarded["root"], root=True)
+            require(type(guarded["paths"]) is list, "Malformed protected paths")
+            for path in guarded["paths"]:
+                portable(path)
+        require(
+            len(policy["repositories"]) == len(self.repositories),
+            "Integration must select the complete registered topology",
+        )
+        self.source_repositories = {}
+        for repository, specification in zip(self.repositories, policy["repositories"]):
+            require(repository.outgoing == [], "Local integration does not approve outgoing pushes")
+            require(
+                set(specification) <= {"label", "root", "remote", "branch", "gitlinks", "allowedPaths"},
+                "Malformed policy repository",
+            )
+            require(
+                specification.get("label") == repository.label
+                and (self.root if specification.get("root") == "." else self.root / specification["root"])
+                == repository.root
+                and specification.get("remote") == repository.remote
+                and specification.get("branch") == repository.branch
+                and specification.get("gitlinks", {}) == repository.gitlinks,
+                "Integration target differs from registered policy",
+            )
+            allowed = specification.get("allowedPaths")
+            require(allowed is None or type(allowed) is list, "Malformed source eligibility")
+            if allowed is not None:
+                require(
+                    set(repository.paths) <= {portable(path) for path in allowed} | set(repository.gitlinks),
+                    "Parent/source integration path is not eligible",
+                )
+            source = sources[repository.label]
+            if source is None:
+                require(not repository.paths, "Unchanged dependencies cannot stage source")
+                self.source_repositories[repository.label] = repository
+                continue
+            require(
+                type(source) is dict and set(source) == {"path", "branch", "head"},
+                "Malformed source worktree selection",
+            )
+            require(isinstance(source["path"], str), "Source path is invalid")
+            selected = canonical(Path(source["path"]), directory=True)
+            require(
+                selected != repository.root
+                and isinstance(source["branch"], str)
+                and source["branch"] != repository.branch
+                and not source["branch"].startswith("-"),
+                "Source must be a separate feature worktree",
+            )
+            require(
+                isinstance(source["head"], str) and REVISION.fullmatch(source["head"]),
+                "Source HEAD must be explicit",
+            )
+            self.source_repositories[repository.label] = Repository(
+                repository.label,
+                selected,
+                repository.remote,
+                source["branch"],
+                source["head"],
+                [],
+                repository.paths,
+                repository.message,
+                repository.gitlinks,
+            )
+
+    def control_path(self):
+        return super().control_path().with_name("git-workspace-integration.json")
+
+    def roots(self):
+        return [
+            self.root,
+            *(repository.root for repository in self.repositories),
+            *(repository.root for repository in self.source_repositories.values()),
+        ]
+
+    def local_control(self):
+        path = self.control_path()
+        if not path.exists():
+            return None
+        canonical(path, exclusive=True)
+        control = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+        require(
+            type(control) is dict
+            and set(control) == {"kind", "selection", "policy", "repositories", "baselines"},
+            "Malformed original integration control",
+        )
+        require(
+            control["kind"] == "local-integration"
+            and control["selection"] == self.selection
+            and control["policy"] == self.policy,
+            "Original integration selection/policy differs; inspect without reconstructing it",
+        )
+        require(
+            set(control["repositories"]) == set(self.by_label)
+            and set(control["baselines"]) == set(self.by_label),
+            "Original integration targets are incomplete",
+        )
+        for label, recorded in control["repositories"].items():
+            require(
+                type(recorded) is dict and set(recorded) == {"phase", "commit"},
+                "Malformed original integration phase",
+            )
+            require(
+                recorded["phase"]
+                in {"selected", "commit-attempted", "source-ready", "merge-attempted", "integrated"},
+                "Unknown integration phase",
+            )
+            require(
+                recorded["commit"] is None
+                or isinstance(recorded["commit"], str)
+                and REVISION.fullmatch(recorded["commit"]),
+                "Malformed original integration commit",
+            )
+            decode_baseline(control["baselines"][label])
+        return control
+
+    def local_state(self, repository, expected_head, *, target=False):
+        require(
+            Path(self.git.text(repository.root, "rev-parse", "--show-toplevel")) == repository.root,
+            "Selected worktree identity changed",
+        )
+        self.git.call(repository.root, "check-ref-format", "--branch", repository.branch)
+        self.require_destination(repository)
+        require(
+            self.git.text(repository.root, "rev-parse", "HEAD") == expected_head,
+            "Selected integration HEAD drifted",
+        )
+        require(
+            not self.git.call(repository.root, "ls-files", "--unmerged", "-z").stdout,
+            "Index conflicts remain",
+        )
+        for name in (
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "rebase-merge",
+            "rebase-apply",
+            "sequencer",
+        ):
+            path = Path(
+                self.git.text(repository.root, "rev-parse", "--path-format=absolute", "--git-path", name)
+            )
+            require(not os.path.lexists(path), "Another Git operation is in progress")
+        changes = self.status(repository)
+        self.validate_paths(repository, changes)
+        if target:
+            require(
+                all(
+                    change.path in repository.gitlinks and change.index == " " and change.worktree == "M"
+                    for change in changes
+                ),
+                "Canonical target has unrelated source/index changes",
+            )
+        self.git.call(repository.root, "diff", "--check")
+        self.git.call(repository.root, "diff", "--cached", "--check")
+
+    def review_local(self, control=None):
+        indexes = []
+        for repository in self.repositories:
+            source = self.source_repositories[repository.label]
+            require(
+                git_identity(self.git, source.root) == git_identity(self.git, repository.root),
+                "Source worktree belongs to another repository",
+            )
+            recorded = (
+                control["repositories"][repository.label]
+                if control
+                else {"phase": "selected", "commit": None}
+            )
+            target_head = recorded["commit"] if recorded["phase"] == "integrated" else repository.head
+            if recorded["phase"] == "merge-attempted":
+                observed = self.git.text(repository.root, "rev-parse", "HEAD")
+                require(observed in {repository.head, recorded["commit"]}, "Original merge target drifted")
+                target_head = observed
+            source_head = recorded["commit"] or source.head
+            if recorded["phase"] == "commit-attempted":
+                source_head = self.git.text(source.root, "rev-parse", "HEAD")
+                if source_head != source.head:
+                    self.verify_commit(source, source_head)
+            self.local_state(repository, target_head, target=True)
+            self.local_state(source, source_head)
+            if repository.gitlinks:
+                self.require_registration(repository)
+            self.git.call(source.root, "merge-base", "--is-ancestor", repository.head, source_head)
+            changed = set(
+                self.git.call(
+                    source.root, "diff", "--name-only", "--no-renames", "-z", repository.head, source_head
+                )
+                .stdout.decode("utf-8")
+                .split("\0")
+            ) - {""}
+            require(changed <= set(repository.paths), "Incoming feature commits contain unapproved paths")
+            if source.root != repository.root:
+                registration = (
+                    self.git.call(source.root, "worktree", "list", "--porcelain", "-z")
+                    .stdout.decode("utf-8")
+                    .split("\0")
+                )
+                require(
+                    sum(field == "branch refs/heads/" + source.branch for field in registration) == 1,
+                    "Source feature branch has no unique owner",
+                )
+            index = Path(
+                self.git.text(source.root, "rev-parse", "--path-format=absolute", "--git-path", "index")
+            )
+            canonical(index, exclusive=True)
+            indexes.append(index)
+            if control and recorded["phase"] != "integrated":
+                expected = decode_baseline(control["baselines"][repository.label])
+                expected["head"] = source_head
+                require(self.snapshot(source) == expected, "Captured integration source/index changed")
+        require(len(indexes) == len(set(indexes)), "Selected source worktrees share an index")
+        return {
+            "status": "integration-reviewed",
+            "repositories": [repository.label for repository in self.repositories],
+        }
+
+    def verify_local(self, control):
+        self.review_local(control)
+        for repository in self.repositories:
+            require(
+                control["repositories"][repository.label]["phase"] == "integrated",
+                "Local integration is incomplete",
+            )
+            for path, label in repository.gitlinks.items():
+                require(
+                    self.git.text(repository.root, "rev-parse", "HEAD:" + path)
+                    == control["repositories"][label]["commit"],
+                    "Parent pin differs from the observed canonical child",
+                )
+
+    def integrate(self, *, dry_run=False, continue_operation=False):
+        if dry_run:
+            require(
+                not continue_operation and self.local_control() is None,
+                "Preview cannot continue an original integration",
+            )
+            return self.review_local()
+        with git_guard(self.git, self.roots(), self.control_path()):
+            canonical(self.policy_path, exclusive=True)
+            require(
+                json.loads(self.policy_path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+                == self.policy,
+                "Integration policy changed before state capture",
+            )
+            control = self.local_control()
+            require(
+                (control is not None) == continue_operation,
+                "Inspect and explicitly continue the original integration",
+            )
+            self.review_local(control)
+            if control is None:
+                control = {
+                    "kind": "local-integration",
+                    "selection": self.selection,
+                    "policy": self.policy,
+                    "repositories": {
+                        repository.label: {"phase": "selected", "commit": None}
+                        for repository in self.repositories
+                    },
+                    "baselines": {
+                        label: encode_baseline(self.snapshot(source))
+                        for label, source in self.source_repositories.items()
+                    },
+                }
+                self.save_control(control, create=True)
+            for repository in self.repositories:
+                recorded = control["repositories"][repository.label]
+                source = self.source_repositories[repository.label]
+                if recorded["phase"] == "integrated":
+                    continue
+                if recorded["phase"] in {"selected", "commit-attempted"}:
+                    expected = decode_baseline(control["baselines"][repository.label])
+                    observed = self.git.text(source.root, "rev-parse", "HEAD")
+                    if recorded["phase"] == "commit-attempted" and observed != source.head:
+                        self.verify_commit(source, observed)
+                        require(
+                            self.sources(source) == expected["sources"]
+                            and self.snapshot(source)["index"] == expected["index"],
+                            "Source/hook changed after original integration commit intent",
+                        )
+                    else:
+                        require(
+                            self.snapshot(source) == expected,
+                            "Source/index changed before integration staging",
+                        )
+                        if repository.gitlinks:
+                            for path, label in repository.gitlinks.items():
+                                child = control["repositories"][label]
+                                require(
+                                    child["phase"] == "integrated"
+                                    and self.git.text(self.by_label[label].root, "rev-parse", "HEAD")
+                                    == child["commit"],
+                                    "Parent waits for verified canonical children",
+                                )
+                                self.git.call(
+                                    source.root,
+                                    "update-index",
+                                    "--add",
+                                    "--cacheinfo",
+                                    "160000," + child["commit"] + "," + path,
+                                )
+                        staged_source = Repository(
+                            source.label,
+                            source.root,
+                            source.remote,
+                            source.branch,
+                            source.head,
+                            [],
+                            {
+                                path: mode
+                                for path, mode in source.paths.items()
+                                if path not in source.gitlinks
+                            },
+                            source.message,
+                        )
+                        if repository.gitlinks:
+                            changes = self.status(source)
+                            self.validate_paths(source, changes)
+                            for path, mode in staged_source.paths.items():
+                                if mode != "index" and any(
+                                    change.path == path or change.original == path for change in changes
+                                ):
+                                    self.git.call(source.root, "add", "--all", "--", path)
+                            staged = set(
+                                self.git.call(source.root, "diff", "--cached", "--name-only", "-z")
+                                .stdout.decode("utf-8")
+                                .split("\0")
+                            ) - {""}
+                            require(
+                                staged <= set(source.paths), "Parent index changed outside approved scope"
+                            )
+                            changed = bool(staged)
+                        else:
+                            changed = self.stage(source)
+                        require(
+                            self.sources(source) == expected["sources"],
+                            "Source changed during integration staging",
+                        )
+                        if changed:
+                            recorded["phase"] = "commit-attempted"
+                            staged_state = self.snapshot(source)
+                            control["baselines"][repository.label] = encode_baseline(staged_state)
+                            self.save_control(control)
+                            self.git.call(source.root, "commit", "-m", source.message)
+                            observed = self.git.text(source.root, "rev-parse", "HEAD")
+                            self.verify_commit(source, observed)
+                            require(
+                                self.sources(source) == expected["sources"]
+                                and self.snapshot(source)["index"] == staged_state["index"],
+                                "Source/hook changed during integration commit; inspect original intent",
+                            )
+                    recorded.update(phase="source-ready", commit=observed)
+                    control["baselines"][repository.label] = encode_baseline(self.snapshot(source))
+                    self.save_control(control)
+                require(
+                    self.snapshot(source) == decode_baseline(control["baselines"][repository.label]),
+                    "Source changed before canonical integration",
+                )
+                actual = self.git.text(repository.root, "rev-parse", "HEAD")
+                require(
+                    actual in {repository.head, recorded["commit"]},
+                    "Canonical target advanced outside the original intent",
+                )
+                if actual != recorded["commit"]:
+                    self.local_state(repository, repository.head, target=True)
+                    recorded["phase"] = "merge-attempted"
+                    self.save_control(control)
+                    self.git.call(repository.root, "merge", "--ff-only", "--no-autostash", recorded["commit"])
+                self.local_state(repository, recorded["commit"], target=True)
+                recorded["phase"] = "integrated"
+                self.save_control(control)
+            self.verify_local(control)
+            result = {
+                "status": "locally-integrated",
+                "pushed": False,
+                "repositories": [
+                    {"label": repository.label, "commit": control["repositories"][repository.label]["commit"]}
+                    for repository in self.repositories
+                ],
+            }
+            self.control_path().unlink()
+            return result
+
+
+def integration_command(arguments, git):
+    require(
+        arguments.policy is not None and arguments.selection is not None,
+        "Local integration requires policy and exact selection",
+    )
+    require(
+        not arguments.confirm_all_current and arguments.message is None,
+        "Local integration never implies all-current delivery or push",
+    )
+    require(
+        arguments.operation == "integrate"
+        or not (arguments.confirm or arguments.continue_operation or arguments.dry_run),
+        "Integration inspection rejects mutation options",
+    )
+    require(
+        arguments.operation != "integrate" or arguments.dry_run or arguments.confirm,
+        "Explicit local commit/merge confirmation is required",
+    )
+    selected = canonical(arguments.selection, exclusive=True)
+    root = canonical(arguments.workspace, directory=True)
+    require(not selected.is_relative_to(root), "Selection must remain outside the workspace")
+    policy_path = canonical(arguments.policy, exclusive=True)
+    policy = json.loads(policy_path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    selection = json.loads(selected.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    route = Integration(root, selection, git, policy, policy_path)
+    if arguments.operation == "inspect-integration":
+        control = route.local_control()
+        route.review_local(control)
+        return {
+            "status": "integration-inspected",
+            "original": control is not None,
+            "repositories": control["repositories"] if control else {},
+        }
+    return route.integrate(dry_run=arguments.dry_run, continue_operation=arguments.continue_operation)
+
+
 def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("review", "apply", "inspect"))
+    parser.add_argument(
+        "operation", choices=("review", "apply", "inspect", "integrate", "inspect-integration")
+    )
     parser.add_argument("--workspace", type=Path, required=True)
-    inputs = parser.add_mutually_exclusive_group(required=True)
-    inputs.add_argument("--selection", type=Path)
-    inputs.add_argument("--policy", type=Path)
+    parser.add_argument("--selection", type=Path)
+    parser.add_argument("--policy", type=Path)
     parser.add_argument("--git", type=Path, required=True)
     parser.add_argument("--message")
     parser.add_argument("--confirm-all-current", action="store_true")
@@ -1181,6 +1696,14 @@ def main(arguments=None):
     parser.add_argument("--confirm", action="store_true")
     arguments = parser.parse_args(arguments)
     try:
+        if arguments.operation in {"integrate", "inspect-integration"}:
+            result = integration_command(arguments, Git(arguments.git))
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        require(
+            (arguments.policy is None) != (arguments.selection is None),
+            "Select exactly one delivery policy or reviewed selection",
+        )
         if arguments.policy is not None:
             require(not arguments.confirm, "Policy delivery uses explicit all-current approval")
             if arguments.operation != "apply":

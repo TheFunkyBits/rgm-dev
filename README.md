@@ -126,6 +126,47 @@ Completion removes this operation's
 control, not independent records, tags or history. JSON outcomes go to stdout; sanitized failures
 go to stderr. Hooks and push-triggered source CI retain their owning behavior and approvals.
 
+### Shared Git Guard And Local Integration
+
+Mutating delivery and local integration acquire the same fail-fast OS lock in every selected
+repository's canonical Git common directory, including the selected parent. Linked worktrees
+therefore contend on the same identity; standalone child delivery also contends with coupled
+integration involving that child. The complete deduplicated lock set is acquired in deterministic
+order before state capture and retained through child updates, parent commit and verification.
+Partial acquisition, exceptions and process exit release ownership, not unresolved recovery state.
+Do not delete lock files, wait around another owner or infer ownership from file presence.
+Read-only review/preview/inspection does not acquire locks and is not a reservation.
+
+Explicit local integration uses the same reviewed selection fields and caller-owned policy, with
+an additional `source` per repository: `{ "path": "<absolute-feature-worktree>", "branch": "<feature>",
+"head": "<full-reviewed-commit>" }`. `head` outside `source` remains the expected canonical target
+tip. `outgoing` is empty: this route approves no push. An unchanged dependency uses `source: null`
+and empty `paths`; the parent uses its own feature worktree with explicit gitlink paths. Incoming
+committed differences and new staged source must stay within the exact selected paths. Parent
+source eligibility and registered child topology come from the same caller policy as delivery.
+
+```text
+python -B scripts/git_workspace.py integrate --workspace <canonical-root> --policy <caller-policy.json> --selection <external-reviewed.json> --git <absolute-git> --dry-run
+python -B scripts/git_workspace.py integrate --workspace <canonical-root> --policy <caller-policy.json> --selection <external-reviewed.json> --git <absolute-git> --confirm
+python -B scripts/git_workspace.py inspect-integration --workspace <canonical-root> --policy <caller-policy.json> --selection <external-reviewed.json> --git <absolute-git>
+python -B scripts/git_workspace.py integrate --workspace <canonical-root> --policy <caller-policy.json> --selection <external-reviewed.json> --git <absolute-git> --continue --confirm
+```
+
+All target/source identity, clean-index, expected-tip, scope and ancestry checks precede canonical
+mutation. Source commits are exact-scoped; canonical targets advance fast-forward-only. Parent
+pins select the observed integrated child commits. A divergent/stale selection refuses: reconcile
+and verify in owned feature worktrees rather than implicitly rebase, stash, reset or force.
+Local integration never fetches, pushes, tags or publishes. Original intent/captured state is
+retained as `git-workspace-integration.json` in the selected workspace's Git administration;
+inspect an interruption and explicitly continue only that original selection, never replay a
+fresh selection over it. Pending controls in other registered worktrees refuse shared mutation.
+
+All supported automation must use these maintained routes rather than ad-hoc canonical Git command
+sequences. The locks are advisory: direct manual Git and uncooperative external tools are not
+prevented. Adopt only after affected older owners have finished or reconciled their original
+controls; do not activate competing old/new protocols or take over their state. Authority changes
+retain reviewed integration/delivery approval. Independent editing and build ownership are unchanged.
+
 Focused tests: `python -B -m unittest discover -s scripts/tests -p test_git_workspace.py`.
 They use only synthetic worktrees and local bare remotes; host qualification requires actual execution.
 

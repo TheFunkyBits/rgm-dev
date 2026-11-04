@@ -2,12 +2,13 @@
 
 import copy
 import json
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -112,6 +113,334 @@ class GitWorkspaceTest(unittest.TestCase):
                 specification["allowedPaths"] = ["parent.txt"]
             repositories.append(specification)
         return {"repositories": repositories, "protected": []}
+
+    @contextmanager
+    def held_guard(self, roots):
+        code = "import json,sys;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import git_workspace as owner\nwith owner.git_guard(owner.Git(Path(sys.argv[2])),[Path(value) for value in json.loads(sys.argv[3])]):\n print('locked',flush=True)\n sys.stdin.readline()\n"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                code,
+                str(Path(delivery.__file__).parent),
+                str(self.executable),
+                json.dumps([str(root) for root in roots]),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+        try:
+            self.assertEqual("locked\n", process.stdout.readline())
+            yield process
+        finally:
+            _output, errors = process.communicate(input="release\n", timeout=10)
+            if process.returncode not in (0, -9, 1):
+                self.fail(errors)
+
+    def integration_fixture(self):
+        _root, entry = self.repository("child")
+        entry["paths"] = [{"path": "source.txt", "stage": "worktree"}]
+        self.parent(["child"])
+        selection = copy.deepcopy(self.selection)
+        for selected in selection["repositories"]:
+            target = self.workspace if selected["root"] == "." else self.workspace / selected["root"]
+            feature = self.base / ("feature-" + selected["label"])
+            branch = "feature/" + selected["label"]
+            self.command(target, "worktree", "add", "--quiet", "-b", branch, str(feature))
+            selected["source"] = {
+                "path": str(feature),
+                "branch": branch,
+                "head": self.command(feature, "rev-parse", "HEAD"),
+            }
+        feature = Path(selection["repositories"][0]["source"]["path"])
+        (feature / "source.txt").write_text("integrated source\n", encoding="utf-8", newline="\n")
+        self.command(feature, "add", "--", "source.txt")
+        self.command(feature, "commit", "--quiet", "-m", "Reviewed feature")
+        selection["repositories"][0]["source"]["head"] = self.command(feature, "rev-parse", "HEAD")
+        policy_path = self.base / "integration-policy.json"
+        policy_path.write_text(json.dumps(self.policy()), encoding="utf-8")
+        return delivery.Integration(self.workspace, selection, self.git, self.policy(), policy_path)
+
+    def test_common_guard_contends_across_linked_worktrees_and_releases_on_exit(self):
+        root, _ = self.repository("child")
+        feature = self.base / "linked"
+        self.command(root, "worktree", "add", "--quiet", "-b", "feature/linked", str(feature))
+        self.assertEqual(delivery.git_identity(self.git, root), delivery.git_identity(self.git, feature))
+        with (
+            self.held_guard([root]),
+            self.assertRaisesRegex(delivery.DeliveryError, "holds the lock"),
+            delivery.git_guard(self.git, [feature]),
+        ):
+            self.fail("Shared repository was double-owned")
+        with delivery.git_guard(self.git, [feature]):
+            pass
+
+    def test_guard_partial_failure_releases_preceding_repository_and_disjoint_roots_overlap(self):
+        root, _ = self.repository("child")
+        other, _ = self.repository("other")
+        with self.held_guard([root]):
+            with delivery.git_guard(self.git, [other]):
+                pass
+            with (
+                self.assertRaisesRegex(delivery.DeliveryError, "holds the lock"),
+                delivery.git_guard(self.git, [self.workspace, root]),
+            ):
+                self.fail("Busy child guard was ignored")
+            with self.held_guard([self.workspace]):
+                pass
+
+    def test_owner_exit_and_body_exception_release_the_shared_guard(self):
+        root, _ = self.repository("child")
+        with self.held_guard([root]) as process:
+            process.kill()
+            process.wait(timeout=10)
+            with delivery.git_guard(self.git, [root]):
+                pass
+        with self.assertRaisesRegex(RuntimeError, "synthetic failure"), delivery.git_guard(self.git, [root]):
+            raise RuntimeError("synthetic failure")
+        with self.held_guard([root]):
+            pass
+
+    def test_integration_and_delivery_refuse_busy_common_store_before_capture(self):
+        integration = self.integration_fixture()
+        child = self.workspace / "child"
+        heads = [
+            self.command(repository.root, "rev-parse", "HEAD") for repository in integration.repositories
+        ]
+        indexes = [
+            self.git.call(repository.root, "ls-files", "--stage", "-z").stdout
+            for repository in integration.repositories
+        ]
+        with self.held_guard([child]):
+            with patch.object(integration, "review_local") as review:
+                with self.assertRaisesRegex(delivery.DeliveryError, "holds the lock"):
+                    integration.integrate()
+                review.assert_not_called()
+            route = self.route()
+            with patch.object(route, "review") as review:
+                with self.assertRaisesRegex(delivery.DeliveryError, "holds the lock"):
+                    route.apply()
+                review.assert_not_called()
+        self.assertFalse(integration.control_path().exists())
+        self.assertFalse(self.route().control_path().exists())
+        self.assertEqual(
+            heads,
+            [self.command(repository.root, "rev-parse", "HEAD") for repository in integration.repositories],
+        )
+        self.assertEqual(
+            indexes,
+            [
+                self.git.call(repository.root, "ls-files", "--stage", "-z").stdout
+                for repository in integration.repositories
+            ],
+        )
+
+    def test_integration_parent_commit_holds_shared_guard_and_never_pushes(self):
+        integration = self.integration_fixture()
+        original_call = self.git.call
+        observed = []
+        remote_heads = {
+            repository.label: self.git.remote_head(repository) for repository in integration.repositories
+        }
+
+        def guarded_call(root, *arguments, **keywords):
+            if arguments[0] in {"commit", "merge", "update-index"}:
+                with (
+                    self.assertRaisesRegex(delivery.DeliveryError, "holds the lock"),
+                    delivery.git_guard(self.git, [self.workspace / "child"]),
+                ):
+                    self.fail("Integration released its lock before parent verification")
+                observed.append(arguments[0])
+            self.assertNotEqual("push", arguments[0])
+            return original_call(root, *arguments, **keywords)
+
+        with patch.object(self.git, "call", side_effect=guarded_call):
+            result = integration.integrate()
+        self.assertEqual("locally-integrated", result["status"])
+        self.assertFalse(result["pushed"])
+        self.assertIn("update-index", observed)
+        self.assertIn("commit", observed)
+        self.assertEqual(
+            "integrated source", self.command(self.workspace / "child", "show", "HEAD:source.txt")
+        )
+        self.assertEqual(
+            self.command(self.workspace / "child", "rev-parse", "HEAD"),
+            self.command(self.workspace, "rev-parse", "HEAD:child"),
+        )
+        self.assertEqual(
+            remote_heads,
+            {repository.label: self.git.remote_head(repository) for repository in integration.repositories},
+        )
+        self.assertFalse(integration.control_path().exists())
+
+    def test_integration_refuses_stale_or_unapproved_feature_before_any_canonical_mutation(self):
+        integration = self.integration_fixture()
+        malformed = copy.deepcopy(integration.selection)
+        del malformed["repositories"][0]["label"]
+        with self.assertRaisesRegex(delivery.DeliveryError, "valid repository label"):
+            delivery.Integration(
+                self.workspace, malformed, self.git, integration.policy, integration.policy_path
+            )
+        child = integration.repositories[0]
+        original = self.command(child.root, "rev-parse", "HEAD")
+        source = integration.source_repositories[child.label]
+        (source.root / "extra.txt").write_text("unapproved\n", encoding="utf-8")
+        self.command(source.root, "add", "--", "extra.txt")
+        self.command(source.root, "commit", "--quiet", "-m", "Unexpected advancement")
+        with self.assertRaisesRegex(delivery.DeliveryError, "HEAD drifted"):
+            integration.integrate()
+        self.assertEqual(original, self.command(child.root, "rev-parse", "HEAD"))
+        self.assertFalse(integration.control_path().exists())
+
+    def test_real_integration_process_excludes_competitors_through_final_parent_verification(self):
+        integration = self.integration_fixture()
+        selected = self.base / "process-integration.json"
+        selected.write_text(json.dumps(integration.selection), encoding="utf-8")
+        code = "import json,sys;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import git_workspace as owner\nselected=Path(sys.argv[4]);policy=Path(sys.argv[5]);route=owner.Integration(Path(sys.argv[3]),json.loads(selected.read_text()),owner.Git(Path(sys.argv[2])),json.loads(policy.read_text()),policy)\noriginal=route.verify_local\ndef held(control):\n print('verification-held',flush=True)\n sys.stdin.readline()\n original(control)\nroute.verify_local=held\nprint(json.dumps(route.integrate()),flush=True)\n"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                code,
+                str(Path(delivery.__file__).parent),
+                str(self.executable),
+                str(self.workspace),
+                str(selected),
+                str(integration.policy_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+        try:
+            self.assertEqual("verification-held\n", process.stdout.readline())
+            self.assertEqual(
+                self.command(self.workspace / "child", "rev-parse", "HEAD"),
+                self.command(self.workspace, "rev-parse", "HEAD:child"),
+            )
+            before = integration.control_path().read_bytes()
+            heads = {
+                repository.label: self.command(repository.root, "rev-parse", "HEAD")
+                for repository in integration.repositories
+            }
+            with self.assertRaisesRegex(delivery.DeliveryError, "holds the lock"):
+                integration.integrate()
+            with self.assertRaisesRegex(delivery.DeliveryError, "holds the lock"):
+                self.route().apply()
+            child_entry = copy.deepcopy(self.selection["repositories"][0])
+            child_entry["root"] = "."
+            standalone = delivery.Workspace(
+                self.workspace / "child", {"repositories": [child_entry]}, self.git
+            )
+            with self.assertRaisesRegex(delivery.DeliveryError, "holds the lock"):
+                standalone.apply()
+            self.assertEqual(before, integration.control_path().read_bytes())
+            self.assertEqual(
+                heads,
+                {
+                    repository.label: self.command(repository.root, "rev-parse", "HEAD")
+                    for repository in integration.repositories
+                },
+            )
+        finally:
+            output, errors = process.communicate(input="release\n")
+        self.assertEqual(0, process.returncode, errors)
+        self.assertEqual("locally-integrated", json.loads(output)["status"])
+
+    def test_integration_commit_hook_source_change_stops_before_canonical_parent_update(self):
+        integration = self.integration_fixture()
+        original_call = self.git.call
+        parent_before = self.command(self.workspace, "rev-parse", "HEAD")
+        parent_source = integration.source_repositories["parent"]
+
+        def hook_changes(root, *arguments, **keywords):
+            result = original_call(root, *arguments, **keywords)
+            if arguments[0] == "commit" and root == parent_source.root:
+                (root / "parent.txt").write_text("hook changed source\n", encoding="utf-8")
+            return result
+
+        with (
+            patch.object(self.git, "call", side_effect=hook_changes),
+            self.assertRaisesRegex(delivery.DeliveryError, "Source/hook changed"),
+        ):
+            integration.integrate()
+        self.assertEqual(parent_before, self.command(self.workspace, "rev-parse", "HEAD"))
+        self.assertEqual("commit-attempted", integration.local_control()["repositories"]["parent"]["phase"])
+        self.assertEqual(
+            "hook changed source\n", (parent_source.root / "parent.txt").read_text(encoding="utf-8")
+        )
+
+    def test_integration_preserves_original_intent_after_lost_merge_ack(self):
+        integration = self.integration_fixture()
+        original_call = self.git.call
+        interrupted = False
+
+        def lose_ack(root, *arguments, **keywords):
+            nonlocal interrupted
+            result = original_call(root, *arguments, **keywords)
+            if arguments[0] == "merge" and not interrupted:
+                interrupted = True
+                raise delivery.DeliveryError("lost local merge acknowledgement")
+            return result
+
+        with (
+            patch.object(self.git, "call", side_effect=lose_ack),
+            self.assertRaisesRegex(delivery.DeliveryError, "lost local merge"),
+        ):
+            integration.integrate()
+        self.assertTrue(integration.control_path().exists())
+        with self.assertRaisesRegex(delivery.DeliveryError, "explicitly continue"):
+            integration.integrate()
+        self.assertEqual("locally-integrated", integration.integrate(continue_operation=True)["status"])
+
+    def test_pending_linked_operation_refuses_other_worktree_without_adoption(self):
+        root, _ = self.repository("child")
+        feature = self.base / "pending-feature"
+        self.command(root, "worktree", "add", "--quiet", "-b", "feature/pending", str(feature))
+        control = Path(
+            self.command(
+                feature, "rev-parse", "--path-format=absolute", "--git-path", "git-workspace-integration.json"
+            )
+        )
+        control.write_text('{"original":true}\n', encoding="utf-8")
+        with (
+            self.assertRaisesRegex(delivery.DeliveryError, "original Git operation is pending"),
+            delivery.git_guard(self.git, [root]),
+        ):
+            self.fail("Original control was ignored")
+        self.assertEqual('{"original":true}\n', control.read_text(encoding="utf-8"))
+
+    def test_policy_busy_refusal_precedes_all_current_capture(self):
+        root, _ = self.repository("child")
+        policy = self.base / "busy-policy.json"
+        policy.write_text(json.dumps(self.policy()), encoding="utf-8")
+        with self.held_guard([root]), patch.object(delivery.Workspace, "from_policy") as capture:
+            with patch("sys.stderr"):
+                self.assertEqual(
+                    2,
+                    delivery.main(
+                        [
+                            "apply",
+                            "--workspace",
+                            str(self.workspace),
+                            "--policy",
+                            str(policy),
+                            "--git",
+                            str(self.executable),
+                            "--message",
+                            "No capture",
+                            "--confirm-all-current",
+                        ]
+                    ),
+                )
+            capture.assert_not_called()
 
     def test_policy_captures_current_paths_and_explicit_whole_staging_without_a_selection_file(self):
         root, entry = self.repository("child")
